@@ -1,10 +1,15 @@
-import "dotenv/config";
+import dotenv from "dotenv";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
 import sensible from "@fastify/sensible";
 import Fastify from "fastify";
+
+const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+const repositoryRoot = resolve(moduleDirectory, "..", "..");
+dotenv.config({ path: join(repositoryRoot, ".env") });
 
 const app = Fastify({
   logger: {
@@ -24,7 +29,7 @@ await app.register(sensible);
 
 // In production the Vite build is copied to apps/web/dist. During local development,
 // Vite serves the UI separately and proxies /api to this process.
-const webRoot = join(process.cwd(), "apps", "web", "dist");
+const webRoot = join(repositoryRoot, "apps", "web", "dist");
 if (existsSync(webRoot)) {
   await app.register(fastifyStatic, {
     root: webRoot,
