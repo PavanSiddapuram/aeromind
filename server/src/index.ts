@@ -18,7 +18,7 @@ const app = Fastify({
 await app.register(cors, {
   origin: process.env.WEB_ORIGIN
     ? process.env.WEB_ORIGIN.split(",").map((value) => value.trim())
-    : true,
+    : false,
 });
 await app.register(sensible);
 
