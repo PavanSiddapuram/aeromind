@@ -1,10 +1,10 @@
 # Deployment — Google Cloud Run
 
-Status: deployment design. A Dockerfile and production static-asset serving are not part of the first scaffold commit yet.
+Status: Dockerfile and single-container build path are present. The first application release still requires local build validation and a real Cloud Run smoke test.
 
 ## 1. Target topology
 
-One Cloud Run service serves Vite-built frontend assets, Fastify API, SSE endpoints and Gemini adapter. The Gemini key is injected as a server-side secret. Never compile it into the Vite bundle.
+One Cloud Run service serves Vite-built frontend assets, Fastify API and (as implemented) the health endpoint. Future mission APIs, SSE and Gemini adapter will live in the same process for the MVP. The Gemini key must be injected as a server-side secret and must never enter the Vite bundle.
 
 ## 2. Runtime contract
 
@@ -13,47 +13,54 @@ One Cloud Run service serves Vite-built frontend assets, Fastify API, SSE endpoi
 - Expose GET /api/health.
 - Handle SIGTERM gracefully.
 - Prefer stateless request handling.
-- Treat in-memory mission state as ephemeral and single-demo only.
+- Treat in-memory mission state as ephemeral and demo-only.
 
 ## 3. Local development
 
-From repository root:
+Requirements: Node.js 22+ and npm 10+.
 
     cp .env.example .env
     npm install
     npm run dev
 
-Vite is expected on port 5173 and proxies /api to port 8080.
+Vite runs on port 5173 and proxies /api to Fastify on port 8080. In production, Fastify serves the built web assets from apps/web/dist.
 
-## 4. Production image plan
+## 4. Container
 
-The production image should install root workspace dependencies, build shared contracts, build web assets, build server TypeScript, then run Fastify while serving static assets from the same origin. Use a runtime image with required production dependencies.
+The Dockerfile uses Node 22 Alpine, installs the npm workspace, builds shared/server/web packages, and starts the Fastify workspace. The image currently includes build dependencies for a simpler MVP build. A later hardening pass can use a multi-stage production-only runtime image.
 
-Do not put the Gemini key in Docker build arguments or image layers. Inject it at runtime through Secret Manager-backed environment variables or an equivalent protected secret mechanism.
+Build and run locally:
+
+    docker build -t aeromind:local .
+    docker run --rm -p 8080:8080 aeromind:local
+
+The API health endpoint should respond at http://localhost:8080/api/health.
 
 ## 5. Cloud Run checklist
 
 - Select project and region.
 - Enable Cloud Run and Artifact Registry APIs.
 - Create/select a least-privilege runtime service account.
-- Store Gemini API key in Secret Manager.
-- Build and deploy container.
+- Store Gemini API key in Secret Manager once Gemini integration exists.
+- Build and deploy the container.
 - Configure GEMINI_MODEL to a tested model ID.
 - Configure timeout for expected Gemini and SSE use.
-- Restrict CORS to deployed origin.
+- Restrict CORS to known origins (same-origin serving should not require permissive CORS).
 - Enable unauthenticated access only if public judging requires it.
 - Verify /api/health.
-- Run an actual Gemini-backed mission from the public URL.
-- Verify SSE connection/reconnect.
+- Run a real Gemini-backed mission from the public URL after that feature is implemented.
+- Verify SSE connection/reconnect after the event-stream endpoint exists.
 - Confirm logs do not reveal secrets.
 
 ## 6. CLI outline
 
-Replace placeholders with actual values. This assumes a Dockerfile/build configuration exists.
+Replace placeholders with actual values:
 
     gcloud config set project PROJECT_ID
     gcloud services enable run.googleapis.com artifactregistry.googleapis.com
     gcloud run deploy aeromind --source . --region REGION --allow-unauthenticated --set-env-vars NODE_ENV=production,GEMINI_MODEL=MODEL_ID --set-secrets GEMINI_API_KEY=GEMINI_API_KEY:latest
+
+The command assumes the required secret exists. Do not configure a placeholder/empty API key as if Gemini integration were operational.
 
 ## 7. Operational limitations
 
