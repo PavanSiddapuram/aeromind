@@ -58,7 +58,7 @@ export default function DroneSimulation() {
 
         <div className="scene-overlay scene-overlay-bottom">
           <span><RadioTower size={13} /> DRONE / AM-01</span>
-          <span><Camera size={13} /> POV READY (VISUAL PREVIEW)</span>
+          <span><Camera size={13} /> DRONE / ROTOR PREVIEW</span>
           <span>ALT 17 M · BAT 86%</span>
         </div>
       </div>
