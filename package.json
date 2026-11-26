@@ -10,8 +10,8 @@
     "dev:api": "npm run dev --workspace @aeromind/server",
     "dev:web": "npm run dev --workspace @aeromind/web",
     "build": "npm run build --workspace @aeromind/shared && npm run build --workspace @aeromind/server && npm run build --workspace @aeromind/web",
-    "typecheck": "npm run typecheck --workspace @aeromind/shared && npm run typecheck --workspace @aeromind/server && npm run typecheck --workspace @aeromind/web",
-    "test": "npm run test --workspace @aeromind/server"
+    "typecheck": "npm run build --workspace @aeromind/shared && npm run typecheck --workspace @aeromind/server && npm run typecheck --workspace @aeromind/web",
+    "test": "npm run test --workspace @aeromind/shared && npm run test --workspace @aeromind/server"
   },
   "devDependencies": {
     "concurrently": "^9.1.2",
