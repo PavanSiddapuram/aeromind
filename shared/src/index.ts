@@ -47,3 +47,6 @@ export type MissionEvent<TPayload = unknown> = {
   environmentVersion: number;
   payload: TPayload;
 };
+
+export * from "./math/index.js";
+export * from "./geometry/index.js";
