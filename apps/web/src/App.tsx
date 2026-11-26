@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import DroneSimulation from "./components/DroneSimulation";
 import { Activity, ArrowUpRight, Bot, Boxes, Cloud, ShieldCheck } from "lucide-react";
 
 type HealthResponse = {
@@ -49,6 +50,8 @@ export default function App() {
           No simulated movement without a current verification approval.
         </div>
       </section>
+
+      <DroneSimulation />
 
       <section className="grid" aria-label="System layers">
         <article className="panel">
