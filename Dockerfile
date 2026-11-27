@@ -3,12 +3,12 @@ FROM node:22-alpine
 WORKDIR /app
 
 # Copy workspace manifests first to make dependency installation cacheable.
-COPY package.json tsconfig.base.json ./
+COPY package.json package-lock.json tsconfig.base.json ./
 COPY apps/web/package.json ./apps/web/package.json
 COPY server/package.json ./server/package.json
 COPY shared/package.json ./shared/package.json
 
-RUN npm install
+RUN npm ci
 
 COPY . .
 

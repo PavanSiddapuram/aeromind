@@ -1,6 +1,6 @@
 # API and Domain Contracts
 
-Status: proposed contract. Only GET /api/health is implemented in the initial scaffold.
+Status: implemented (`GET /api/health`, `GET /api/scenario`, `GET /api/mission/:missionId`, `POST /api/mission/plan`, `POST /api/mission/verify`, `POST /api/mission/event`, `POST /api/mission/execute`, `POST /api/mission/:missionId/reset`, and `GET /api/mission/:missionId/events`).
 
 ## 1. Conventions
 
@@ -61,7 +61,7 @@ Do not accept arbitrary world coordinates from the model in the MVP. Resolve kno
 
 ## 5. Verification
 
-POST /api/mission/verify accepts mission ID, route ID, environment version, drone state, waypoints and constraints.
+POST /api/mission/verify accepts `missionId`, `routeId` and `expectedEnvironmentVersion`. Because the backend is authoritative for route approval (`INV-08`), verification runs strictly against the server-stored route, drone state, scenario obstacles/geofences and mission constraints rather than client-supplied waypoints or approval flags.
 
 Response contains:
 - approved boolean
