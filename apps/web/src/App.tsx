@@ -1,86 +1,44 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  Activity,
-  AlertTriangle,
-  BatteryWarning,
-  Bot,
-  CheckCircle2,
-  Construction,
-  Flame,
-  Play,
-  Radio,
-  RotateCcw,
-  ShieldAlert,
-  ShieldCheck,
-  Sparkles,
-} from "lucide-react";
+import { AlertCircle } from "lucide-react";
 import {
   FLOOD_SCENARIO,
-  VERIFIER_POLICY_VERSION,
-  type DroneState,
   type EnvironmentMutationEvent,
-  type MissionConstraints,
   type MissionEvent,
-  type MissionPlan,
-  type MissionStatus,
-  type RescueTarget,
-  type ResolvedRoute,
-  type RouteApproval,
-  type ScenarioObstacle,
-  type Vector3,
-  type VerificationReport,
 } from "@aeromind/shared";
 import DroneSimulation from "./components/DroneSimulation";
+import MissionCommandPanel, {
+  type MissionPreset,
+} from "./components/MissionCommandPanel";
+import MissionHeader from "./components/MissionHeader";
+import MissionIntelligenceSection from "./components/MissionIntelligenceSection";
 import type { AeroMindScene, RouteVisualMode } from "./scene/AeroMindScene";
+import {
+  formatReplanOutcome,
+  type HealthResponse,
+  type MissionSnapshot,
+} from "./types";
 
-type HealthResponse = {
-  status: string;
-  service: string;
-  environment: string;
-  planner?: {
-    provider: string;
-    model: string;
-    configured: boolean;
-  };
-  timestamp: string;
-};
+const MISSION_STORAGE_KEY = "aeromind.missionId";
 
-type ReplanOutcome =
-  | "none"
-  | "unchanged_valid"
-  | "local_astar"
-  | "ai_replan"
-  | "safe_hold";
+function getOrCreateTabMissionId(): string {
+  try {
+    const existing = window.sessionStorage.getItem(MISSION_STORAGE_KEY);
+    if (existing && /^[a-zA-Z0-9_-]{4,64}$/.test(existing)) {
+      return existing;
+    }
+    const suffix =
+      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID().slice(0, 8)
+        : Math.random().toString(36).slice(2, 10);
+    const generated = `mission-${suffix}`;
+    window.sessionStorage.setItem(MISSION_STORAGE_KEY, generated);
+    return generated;
+  } catch {
+    return "mission-demo-001";
+  }
+}
 
-type MissionSnapshot = {
-  missionId: string;
-  scenarioId: string;
-  status: MissionStatus;
-  instruction: string;
-  constraints: MissionConstraints;
-  environmentVersion: number;
-  policyVersion: string;
-  drone: DroneState;
-  headingRad: number;
-  windMetersPerSecond: number;
-  obstacles: ScenarioObstacle[];
-  targets: RescueTarget[];
-  plan: MissionPlan | null;
-  plannerModel: string | null;
-  plannerLatencyMs: number | null;
-  lastReplanOutcome: ReplanOutcome;
-  repairAttemptsUsed: number;
-  route: ResolvedRoute | null;
-  verification: VerificationReport | null;
-  lastRejectedVerification: VerificationReport | null;
-  lastRejectedWaypoints: Vector3[] | null;
-  approval: RouteApproval | null;
-  events: MissionEvent[];
-};
-
-const DEFAULT_MISSION_ID = "mission-demo-001";
-
-const MISSION_PRESETS = [
+const MISSION_PRESETS: readonly MissionPreset[] = [
   {
     label: "East Block Priority",
     prompt:
@@ -92,26 +50,11 @@ const MISSION_PRESETS = [
       "Inspect all reachable rooftop beacons across East, West, and South blocks in priority order.",
   },
   {
-    label: "West Clinic Rapid Check",
+    label: "West Clinic Check",
     prompt:
       "Perform a direct inspection of the West Medical Clinic rooftop only and return home with maximum battery margin.",
   },
-] as const;
-
-function formatReplanLabel(outcome: ReplanOutcome): string {
-  switch (outcome) {
-    case "local_astar":
-      return "LOCAL A* REROUTE";
-    case "ai_replan":
-      return "AI MISSION REPLAN";
-    case "unchanged_valid":
-      return "ROUTE STILL VALID";
-    case "safe_hold":
-      return "SAFE HOLD";
-    case "none":
-      return "INITIAL";
-  }
-}
+];
 
 async function readApiError(response: Response): Promise<string> {
   try {
@@ -122,7 +65,7 @@ async function readApiError(response: Response): Promise<string> {
       return `${body.error.code ?? "ERROR"}: ${body.error.message}`;
     }
   } catch {
-    // ignore parse failure
+    // ignore non-JSON body
   }
   return `HTTP ${response.status}`;
 }
@@ -131,9 +74,9 @@ export default function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
 
-  const [missionId] = useState(DEFAULT_MISSION_ID);
+  const [missionId] = useState<string>(() => getOrCreateTabMissionId());
   const [instruction, setInstruction] = useState<string>(
-    MISSION_PRESETS[0].prompt,
+    MISSION_PRESETS[0]!.prompt,
   );
   const [maxAltitudeMeters, setMaxAltitudeMeters] = useState<number>(
     FLOOD_SCENARIO.defaultConstraints.maxAltitudeMeters,
@@ -180,7 +123,7 @@ export default function App() {
       const snapshot = (await response.json()) as MissionSnapshot;
       setMission(snapshot);
     } catch {
-      // Ignore transient poll errors; SSE/manual refresh will recover.
+      // Transient fetch errors recover via SSE or subsequent poll.
     }
   }, []);
 
@@ -189,7 +132,6 @@ export default function App() {
     void fetchSnapshot(missionId);
   }, [fetchSnapshot, missionId, refreshHealth]);
 
-  // Connect live SSE stream for monotonic event trace + automatic state sync.
   useEffect(() => {
     const source = new EventSource(
       `/api/mission/${encodeURIComponent(missionId)}/events`,
@@ -208,11 +150,11 @@ export default function App() {
           const merged = [...prev, parsed].sort(
             (a, b) => a.sequence - b.sequence,
           );
-          return merged.slice(-120);
+          return merged.slice(-150);
         });
         void fetchSnapshot(missionId);
       } catch {
-        // Ignore malformed event frame
+        // Ignore malformed SSE payload
       }
     };
 
@@ -226,7 +168,6 @@ export default function App() {
     };
   }, [fetchSnapshot, missionId]);
 
-  // Smooth telemetry polling while simulation is actively flying on the server.
   useEffect(() => {
     if (mission?.status !== "executing") return;
     const interval = window.setInterval(() => {
@@ -345,7 +286,9 @@ export default function App() {
       setMission(data.mission);
     } catch (error) {
       setActionError(
-        error instanceof Error ? error.message : "Execution authorization failed",
+        error instanceof Error
+          ? error.message
+          : "Execution authorization failed",
       );
     } finally {
       setBusyAction(null);
@@ -358,7 +301,7 @@ export default function App() {
   ) => {
     if (!mission) {
       setActionError(
-        "Start or initialize a mission first so environment mutations bind to an active mission version.",
+        "Plan a mission first so environment mutations bind to an active mission session.",
       );
       return;
     }
@@ -387,7 +330,7 @@ export default function App() {
       setMission(data.mission);
     } catch (error) {
       setActionError(
-        error instanceof Error ? error.message : "Environment event failed",
+        error instanceof Error ? error.message : "Environment mutation failed",
       );
     } finally {
       setBusyAction(null);
@@ -411,9 +354,7 @@ export default function App() {
       setMission(fresh);
       setSseEvents([]);
     } catch (error) {
-      setActionError(
-        error instanceof Error ? error.message : "Reset failed",
-      );
+      setActionError(error instanceof Error ? error.message : "Reset failed");
     } finally {
       setBusyAction(null);
     }
@@ -452,535 +393,264 @@ export default function App() {
 
   const activeViolations = showingRejectedRoute
     ? (mission?.lastRejectedVerification?.violations ?? [])
-    : (mission?.verification && !mission.verification.approved
-        ? mission.verification.violations
-        : (mission?.lastRejectedVerification?.violations ?? []));
-
-  const activeVerification = mission?.verification ?? null;
+    : mission?.verification && !mission.verification.approved
+      ? mission.verification.violations
+      : (mission?.lastRejectedVerification?.violations ?? []);
 
   return (
-    <main className="shell">
-      <header className="topbar">
-        <a className="brand" href="/" aria-label="AeroMind home">
-          <span className="brand-mark">
-            <Activity size={19} />
-          </span>
-          <span>AEROMIND</span>
-          <span className="version">MISSION CONSOLE</span>
-        </a>
-        <div className="topbar-right">
-          <span
-            className={`status-dot ${health?.planner?.configured ? "" : "warn"}`}
-          />
-          {health
-            ? `API ONLINE · ${health.planner?.configured ? "PLANNER READY" : "PLANNER UNCONFIGURED"}`
-            : healthError
-              ? "API OFFLINE"
-              : "CONNECTING…"}
-          <span className="sse-badge">
-            <Radio size={12} /> {sseConnected ? "SSE LIVE" : "SSE SYNC"}
-          </span>
-        </div>
-      </header>
+    <div className="app-layout">
+      <MissionHeader
+        scenarioId={FLOOD_SCENARIO.id}
+        scenarioName={FLOOD_SCENARIO.name}
+        missionStatus={mission?.status ?? "idle"}
+        verificationApproved={
+          mission?.verification ? mission.verification.approved : null
+        }
+        environmentVersion={currentEnvVersion}
+        health={health}
+        healthError={healthError}
+        sseConnected={sseConnected}
+      />
 
-      <section className="hero compact-hero">
-        <div className="eyebrow">
-          <span /> NEURO-SYMBOLIC DISASTER RESPONSE
-        </div>
-        <h1>
-          AI proposes. <em>Geometry verifies.</em>
-        </h1>
-        <p className="hero-copy">
-          Operators express rescue priorities in natural language. The neural
-          planner selects structured target objectives by ID only; deterministic
-          code resolves 3D A* corridors, verifies obstacle, geofence, altitude,
-          and return-reserve bounds, and gates simulated flight on version-bound
-          approvals.
-        </p>
-        <div className="principle">
-          <ShieldCheck size={18} />
-          No simulated movement without an unrevoked approval bound to the active
-          environment version ({VERIFIER_POLICY_VERSION}).
-        </div>
-      </section>
-
-      {health && !health.planner?.configured && (
-        <div className="banner-warning" role="status">
-          <AlertTriangle size={18} />
-          <div>
-            <strong>Planner credentials are not configured on the server yet.</strong>{" "}
-            Configure the server environment key and restart the API to enable live
-            mission planning. Without credentials, planning fails closed into{" "}
-            <code>safe_hold</code>.
+      <main className="console-container">
+        {health && !health.planner?.configured && (
+          <div className="banner banner-warning" role="status">
+            <AlertCircle size={17} aria-hidden="true" />
+            <div>
+              <strong>Server Gemini API key is not configured.</strong> Add{" "}
+              <code>GEMINI_API_KEY</code> to <code>.env</code> and restart the
+              backend to enable live mission planning. Without credentials,
+              planning requests fail closed into <code>SAFE_HOLD</code>.
+            </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {actionError && (
-        <div className="banner-error" role="alert">
-          <ShieldAlert size={18} />
-          <div>{actionError}</div>
-        </div>
-      )}
-
-      <div className="workspace-grid">
-        <div className="workspace-main">
-          <DroneSimulation
-            missionStatus={mission?.status ?? "idle"}
-            environmentVersion={currentEnvVersion}
-            drone={mission?.drone}
-            headingRad={mission?.headingRad}
-            obstacles={mission?.obstacles}
-            targets={mission?.targets}
-            waypoints={sceneWaypoints}
-            returnWaypoints={sceneReturnWaypoints}
-            routeMode={sceneRouteMode}
-            violations={activeViolations}
-            onSceneReady={handleSceneReady}
-          />
-
-          {mission?.lastRejectedVerification && (
-            <div className="overlay-toggle-bar">
-              <span>
-                <ShieldAlert size={14} /> Prior route rejected on ENV v
-                {mission.lastRejectedVerification.environmentVersion} (
-                {mission.lastRejectedVerification.violations
-                  .map((v) => v.code)
-                  .join(", ")}
-                ) · Recovery:{" "}
-                <strong>{formatReplanLabel(mission.lastReplanOutcome)}</strong>
-              </span>
+        {actionError && (
+          <div className="banner banner-danger" role="alert">
+            <AlertCircle size={17} aria-hidden="true" />
+            <div className="banner-body">
+              <span>{actionError}</span>
               <button
                 type="button"
-                className="btn btn-secondary btn-xs"
-                onClick={() => setInspectRejectedOverlay((v) => !v)}
+                className="btn-dismiss"
+                onClick={() => setActionError(null)}
               >
-                {inspectRejectedOverlay
-                  ? "Show Verified Reroute"
-                  : "Inspect Rejected Path"}
+                Dismiss
               </button>
             </div>
-          )}
+          </div>
+        )}
 
-          {/* Chaos & Dynamic Environment Controls */}
-          <section className="panel chaos-panel" aria-label="Chaos injection controls">
-            <div className="panel-header-row">
-              <div>
-                <div className="panel-kicker">DYNAMIC ENVIRONMENT & FAULT INJECTION</div>
-                <h2>Chaos & Replanning Triggers</h2>
-              </div>
-              <span className="env-pill">ENV v{currentEnvVersion}</span>
-            </div>
-            <p className="panel-subcopy">
-              Injecting any material change atomically pauses active execution,
-              increments <code>environmentVersion</code>, revokes prior approvals,
-              and triggers deterministic local A* rerouting before bounded mission
-              replanning (max 2 attempts).
-            </p>
-            <div className="chaos-buttons">
-              <button
-                type="button"
-                className="btn btn-chaos"
-                disabled={busyAction !== null || !mission}
-                onClick={() =>
-                  void handleInjectEvent("crane", {
-                    type: "obstacle.spawned",
-                    obstacleId: "crane-01",
-                  })
-                }
-              >
-                <Construction size={15} />
-                Spawn South Crane (Local A* Reroute)
-              </button>
-
-              <button
-                type="button"
-                className="btn btn-chaos"
-                disabled={busyAction !== null || !mission}
-                onClick={() =>
-                  void handleInjectEvent("debris", {
-                    type: "obstacle.spawned",
-                    obstacleId: "debris-north-01",
-                  })
-                }
-              >
-                <Flame size={15} />
-                Block ROOF-03 Debris (Mission Replan)
-              </button>
-
-              <button
-                type="button"
-                className="btn btn-chaos"
-                disabled={busyAction !== null || !mission}
-                onClick={() =>
-                  void handleInjectEvent("battery-sag", {
-                    type: "battery.changed",
-                    batteryPercent: 52,
-                    reason: "Simulated cell sag to 52%",
-                  })
-                }
-              >
-                <BatteryWarning size={15} />
-                Battery Sag → 52% (Shed Targets)
-              </button>
-
-              <button
-                type="button"
-                className="btn btn-chaos danger"
-                disabled={busyAction !== null || !mission}
-                onClick={() =>
-                  void handleInjectEvent("battery-crit", {
-                    type: "battery.changed",
-                    batteryPercent: 22,
-                    reason: "Critical reserve breach → 22%",
-                  })
-                }
-              >
-                <AlertTriangle size={15} />
-                Critical Battery → 22% (Safe Hold)
-              </button>
-
-              <button
-                type="button"
-                className="btn btn-chaos accent"
-                disabled={busyAction !== null || !mission}
-                onClick={() =>
-                  void handleInjectEvent("target-flare", {
-                    type: "target.discovered",
-                    targetId: "ROOF-05",
-                  })
-                }
-              >
-                <Sparkles size={15} />
-                Discover Urgent Flare (ROOF-05)
-              </button>
-            </div>
-          </section>
-        </div>
-
-        {/* Right Column: Mission Command & Verification Gate */}
-        <aside className="workspace-side">
-          <section className="panel command-panel">
-            <div className="panel-header-row">
-              <div>
-                <div className="panel-kicker">01 / OPERATOR COMMAND</div>
-                <h2>Mission Control</h2>
-              </div>
-              <span className={`status-chip status-${mission?.status ?? "idle"}`}>
-                {(mission?.status ?? "idle").toUpperCase()}
-              </span>
-            </div>
-
-            <div className="preset-chips">
-              {MISSION_PRESETS.map((preset) => (
-                <button
-                  key={preset.label}
-                  type="button"
-                  className="chip-btn"
-                  onClick={() => setInstruction(preset.prompt)}
-                >
-                  {preset.label}
-                </button>
-              ))}
-            </div>
-
-            <label className="field-label" htmlFor="mission-instruction">
-              Natural-language rescue objective
-            </label>
-            <textarea
-              id="mission-instruction"
-              className="mission-textarea"
-              rows={3}
-              value={instruction}
-              onChange={(e) => setInstruction(e.target.value)}
+        {/* Primary 2-Column Workspace: 3D Simulation + Fault Injection (Left) | Command & Gate (Right) */}
+        <div className="workspace-grid">
+          <div className="workspace-primary">
+            <DroneSimulation
+              missionStatus={mission?.status ?? "idle"}
+              activeLeg={mission?.activeLeg ?? null}
+              environmentVersion={currentEnvVersion}
+              drone={mission?.drone}
+              headingRad={mission?.headingRad}
+              obstacles={mission?.obstacles}
+              targets={mission?.targets}
+              waypoints={sceneWaypoints}
+              returnWaypoints={sceneReturnWaypoints}
+              routeMode={sceneRouteMode}
+              violations={activeViolations}
+              onSceneReady={handleSceneReady}
             />
 
-            <div className="constraints-row">
-              <div>
-                <label className="field-label" htmlFor="max-altitude">
-                  Max Altitude (m)
-                </label>
-                <input
-                  id="max-altitude"
-                  type="number"
-                  min={15}
-                  max={80}
-                  className="number-input"
-                  value={maxAltitudeMeters}
-                  onChange={(e) =>
-                    setMaxAltitudeMeters(Number(e.target.value) || 40)
-                  }
-                />
-              </div>
-              <div>
-                <label className="field-label" htmlFor="min-reserve">
-                  Min Reserve (%)
-                </label>
-                <input
-                  id="min-reserve"
-                  type="number"
-                  min={10}
-                  max={60}
-                  className="number-input"
-                  value={minLandingReservePercent}
-                  onChange={(e) =>
-                    setMinLandingReservePercent(Number(e.target.value) || 20)
-                  }
-                />
-              </div>
-            </div>
-
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={includeSceneStill}
-                onChange={(e) => setIncludeSceneStill(e.target.checked)}
-              />
-              <span>Attach 3D scene still image to planner request (multimodal)</span>
-            </label>
-
-            <div className="action-buttons">
-              <button
-                type="button"
-                className="btn btn-primary"
-                disabled={busyAction !== null || instruction.trim().length < 3}
-                onClick={() => void handlePlanMission()}
-              >
-                <Bot size={16} />
-                {busyAction === "plan"
-                  ? "Planning & Verifying…"
-                  : "Plan & Verify Mission"}
-              </button>
-
-              <button
-                type="button"
-                className="btn btn-execute"
-                disabled={busyAction !== null || !canExecute}
-                onClick={() => void handleExecute()}
-              >
-                <Play size={16} />
-                {busyAction === "execute"
-                  ? "Authorizing…"
-                  : canExecute
-                    ? "Authorize & Execute Approved Route"
-                    : "Execution Locked (Needs Current Approval)"}
-              </button>
-
-              <div className="secondary-actions">
-                <button
-                  type="button"
-                  className="btn btn-secondary"
-                  disabled={busyAction !== null || !mission?.route}
-                  onClick={() => void handleReverify()}
-                >
-                  Re-Verify Route
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-secondary"
-                  disabled={busyAction !== null}
-                  onClick={() => void handleReset()}
-                >
-                  <RotateCcw size={14} /> Reset Demo
-                </button>
-              </div>
-            </div>
-          </section>
-
-          {/* Deterministic Verifier & Approval Record */}
-          <section className="panel verifier-panel">
-            <div className="panel-header-row">
-              <div>
-                <div className="panel-kicker">02 / DETERMINISTIC FEASIBILITY FACTS</div>
-                <h2>Verifier & Approval Gate</h2>
-              </div>
-              {activeVerification && (
-                <span
-                  className={`tag ${activeVerification.approved ? "ready" : "rejected"}`}
-                >
-                  {activeVerification.approved
-                    ? "Passed simulation checks"
-                    : "Rejected"}
-                </span>
-              )}
-            </div>
-
-            {activeVerification ? (
-              <div className="kv-stack">
-                <div className="kv-grid">
-                  <div>
-                    <span>Mission Energy</span>
-                    <strong>
-                      {activeVerification.estimatedMissionEnergyPercent.toFixed(1)}%
-                    </strong>
-                  </div>
-                  <div>
-                    <span>Return (RTH)</span>
-                    <strong>
-                      {activeVerification.estimatedReturnEnergyPercent.toFixed(1)}%
-                    </strong>
-                  </div>
-                  <div>
-                    <span>Projected Reserve</span>
-                    <strong
-                      className={
-                        activeVerification.energy.feasible ? "ok-text" : "err-text"
-                      }
-                    >
-                      {activeVerification.projectedLandingReservePercent.toFixed(1)}%
-                      {" / "}
-                      {activeVerification.energy.requiredReservePercent}% min
-                    </strong>
-                  </div>
-                  <div>
-                    <span>Approval Token</span>
-                    <strong>
-                      {mission?.approval && !mission.approval.revokedAt
-                        ? `${mission.approval.approvalId} (v${mission.approval.environmentVersion})`
-                        : "NONE / REVOKED"}
-                    </strong>
-                  </div>
+            {mission?.lastRejectedVerification && (
+              <div className="rejected-inspect-bar" role="status">
+                <div className="rejected-inspect-copy">
+                  <strong>
+                    Prior route invalidated on ENV v
+                    {mission.lastRejectedVerification.environmentVersion}
+                  </strong>
+                  <span>
+                    Violations:{" "}
+                    {mission.lastRejectedVerification.violations
+                      .map((v) => v.code)
+                      .join(", ")}{" "}
+                    · Outcome:{" "}
+                    {formatReplanOutcome(mission.lastReplanOutcome).label}
+                  </span>
                 </div>
-
-                {activeViolations.length > 0 && (
-                  <div className="violation-list">
-                    <div className="violation-title">Recorded Violations</div>
-                    {activeViolations.map((v, idx) => (
-                      <div key={`${v.code}-${idx}`} className="violation-item">
-                        <code>{v.code}</code>
-                        <span>{v.message}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
+                <button
+                  type="button"
+                  className="btn btn-outlined btn-sm"
+                  onClick={() => setInspectRejectedOverlay((v) => !v)}
+                >
+                  {inspectRejectedOverlay
+                    ? "Show Active Route"
+                    : "Inspect Rejected Path"}
+                </button>
               </div>
-            ) : (
-              <p className="empty-copy">
-                No route verified yet. Submit a mission plan to run segment/AABB,
-                geofence, altitude, and RTH reserve checks.
-              </p>
             )}
 
-            <div className="coeff-footnote">
-              Configured energy model (uncalibrated synthetic %):{" "}
-              {FLOOD_SCENARIO.energyConfig.travelPercentPerMeter}%/m travel ·{" "}
-              {FLOOD_SCENARIO.energyConfig.climbPercentPerMeter}%/m climb ·{" "}
-              {(FLOOD_SCENARIO.energyConfig.windFactorPerMeterPerSecond * 100).toFixed(0)}
-              %/(m/s) wind · {FLOOD_SCENARIO.energyConfig.inspectionOperationPercent}
-              %/target dwell.
-            </div>
-          </section>
-        </aside>
-      </div>
-
-      {/* Bottom Inspection Row: Planner Proposal + Targets + SSE Event Timeline */}
-      <section className="inspection-grid" aria-label="Plan and event telemetry">
-        <article className="panel">
-          <div className="panel-kicker">03 / PROBABILISTIC PLANNER PROPOSAL</div>
-          <h2>Planner Decision Summary</h2>
-          {mission?.plan ? (
-            <div className="plan-details">
-              <p className="decision-quote">{mission.plan.decisionSummary}</p>
-              <div className="meta-badges">
-                {mission.plannerLatencyMs !== null && (
-                  <span className="mini-pill">
-                    Planner latency: {mission.plannerLatencyMs} ms
-                  </span>
-                )}
-                <span className="mini-pill">
-                  Pattern: {mission.plan.searchPattern}
-                </span>
-                <span className="mini-pill">
-                  Plan status: {mission.plan.missionStatus}
-                </span>
-              </div>
-              <div className="id-sequence">
-                <strong>Target order:</strong>{" "}
-                {mission.plan.targetOrder.length > 0
-                  ? mission.plan.targetOrder.join(" → ")
-                  : "None"}
-              </div>
-              {mission.plan.abortedObjectives.length > 0 && (
-                <div className="id-sequence warn-text">
-                  <strong>Aborted objectives:</strong>{" "}
-                  {mission.plan.abortedObjectives.join(", ")}
-                </div>
-              )}
-              {mission.route && (
-                <div className="id-sequence muted-text">
-                  <strong>Resolved A* graph path ({mission.route.distanceMeters.toFixed(0)}m + {mission.route.returnDistanceMeters.toFixed(0)}m RTH):</strong>{" "}
-                  {mission.route.nodeIds.join(" → ")}
-                </div>
-              )}
-            </div>
-          ) : (
-            <p className="empty-copy">
-              Awaiting first mission request. The planner receives only canonical
-              target and graph-node IDs, never raw world coordinates.
-            </p>
-          )}
-
-          <div className="targets-mini-list">
-            {(mission?.targets ?? FLOOD_SCENARIO.targets).map((target) => (
-              <div key={target.id} className="target-row">
+            {/* Dynamic Environment & Recovery Controls */}
+            <section
+              className="card fault-card"
+              aria-labelledby="fault-controls-heading"
+            >
+              <div className="card-header">
                 <div>
-                  <strong>{target.id}</strong> · {target.label} ({target.sector}, P
-                  {target.priority})
+                  <div className="section-eyebrow">
+                    Dynamic Environment Simulation · ENV v{currentEnvVersion}
+                  </div>
+                  <h2 id="fault-controls-heading" className="card-title">
+                    Scenario Mutations & Recovery Triggers
+                  </h2>
                 </div>
-                <span className={`target-badge target-${target.status}`}>
-                  {target.status === "visited" && <CheckCircle2 size={12} />}
-                  {target.status}
-                </span>
               </div>
-            ))}
+              <p className="card-description">
+                Inject live spatial or battery changes before or during flight.
+                Each mutation pauses active movement, revokes prior approvals,
+                and attempts local A* recovery before escalating to bounded
+                Gemini replanning.
+              </p>
+
+              <div className="fault-grid">
+                <button
+                  type="button"
+                  className="fault-btn"
+                  disabled={busyAction !== null || !mission}
+                  onClick={() =>
+                    void handleInjectEvent("crane", {
+                      type: "obstacle.spawned",
+                      obstacleId: "crane-01",
+                    })
+                  }
+                >
+                  <span className="fault-title">Spawn South Crane</span>
+                  <span className="fault-sub">
+                    Blocks south corridor · Tier 1 local A* reroute
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  className="fault-btn"
+                  disabled={busyAction !== null || !mission}
+                  onClick={() =>
+                    void handleInjectEvent("debris", {
+                      type: "obstacle.spawned",
+                      obstacleId: "debris-north-01",
+                    })
+                  }
+                >
+                  <span className="fault-title">Block ROOF-03 Approach</span>
+                  <span className="fault-sub">
+                    Isolates East School · Tier 2 Gemini replan
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  className="fault-btn"
+                  disabled={busyAction !== null || !mission}
+                  onClick={() =>
+                    void handleInjectEvent("battery-sag", {
+                      type: "battery.changed",
+                      batteryPercent: 52,
+                      reason: "Simulated cell sag to 52%",
+                    })
+                  }
+                >
+                  <span className="fault-title">Battery Sag → 52%</span>
+                  <span className="fault-sub">
+                    Reduces reserve · Sheds lower-priority targets
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  className="fault-btn fault-btn-danger"
+                  disabled={busyAction !== null || !mission}
+                  onClick={() =>
+                    void handleInjectEvent("battery-crit", {
+                      type: "battery.changed",
+                      batteryPercent: 22,
+                      reason: "Critical reserve breach → 22%",
+                    })
+                  }
+                >
+                  <span className="fault-title">Critical Battery → 22%</span>
+                  <span className="fault-sub">
+                    Breaches landing reserve · Enters SAFE_HOLD
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  className="fault-btn"
+                  disabled={busyAction !== null || !mission}
+                  onClick={() =>
+                    void handleInjectEvent("target-flare", {
+                      type: "target.discovered",
+                      targetId: "ROOF-05",
+                    })
+                  }
+                >
+                  <span className="fault-title">Discover Target ROOF-05</span>
+                  <span className="fault-sub">
+                    Urgent East Hub beacon · Re-evaluates priorities
+                  </span>
+                </button>
+              </div>
+            </section>
           </div>
-        </article>
 
-        <article className="panel">
-          <div className="panel-header-row">
-            <div>
-              <div className="panel-kicker">04 / AUTHORITATIVE AUDIT TRACE</div>
-              <h2>Live SSE Event Timeline</h2>
-            </div>
-            <span className="mini-pill">{activeEvents.length} events</span>
-          </div>
+          <aside className="workspace-secondary">
+            <MissionCommandPanel
+              missionStatus={mission?.status ?? "idle"}
+              environmentVersion={currentEnvVersion}
+              instruction={instruction}
+              onInstructionChange={setInstruction}
+              presets={MISSION_PRESETS}
+              maxAltitudeMeters={maxAltitudeMeters}
+              onMaxAltitudeChange={setMaxAltitudeMeters}
+              minLandingReservePercent={minLandingReservePercent}
+              onMinReserveChange={setMinLandingReservePercent}
+              includeSceneStill={includeSceneStill}
+              onIncludeSceneStillChange={setIncludeSceneStill}
+              verification={mission?.verification ?? null}
+              activeViolations={activeViolations}
+              approval={mission?.approval ?? null}
+              hasRoute={Boolean(mission?.route)}
+              canExecute={canExecute}
+              busyAction={busyAction}
+              onPlanMission={() => void handlePlanMission()}
+              onReverify={() => void handleReverify()}
+              onExecute={() => void handleExecute()}
+              onReset={() => void handleReset()}
+            />
+          </aside>
+        </div>
 
-          {activeEvents.length > 0 ? (
-            <ol className="timeline-list">
-              {[...activeEvents].reverse().map((evt) => (
-                <li key={evt.eventId} className="timeline-item">
-                  <div className="timeline-top">
-                    <span className="seq-tag">#{evt.sequence}</span>
-                    <code className="evt-type">{evt.type}</code>
-                    <span className="evt-ver">ENV v{evt.environmentVersion}</span>
-                    <span className="evt-time">
-                      {new Date(evt.occurredAt).toLocaleTimeString()}
-                    </span>
-                  </div>
-                  <div className="timeline-payload">
-                    {JSON.stringify(evt.payload)}
-                  </div>
-                </li>
-              ))}
-            </ol>
-          ) : (
-            <p className="empty-copy">
-              Monotonic mission events stream here over Server-Sent Events (
-              <code>/api/mission/{missionId}/events</code>).
-            </p>
-          )}
-        </article>
-      </section>
+        {/* Lower Section: Mission Intelligence & Live Event History */}
+        <MissionIntelligenceSection
+          plan={mission?.plan ?? null}
+          plannerModel={mission?.plannerModel ?? null}
+          plannerLatencyMs={mission?.plannerLatencyMs ?? null}
+          route={mission?.route ?? null}
+          targets={mission?.targets ?? FLOOD_SCENARIO.targets}
+          lastReplanOutcome={mission?.lastReplanOutcome ?? "none"}
+          repairAttemptsUsed={mission?.repairAttemptsUsed ?? 0}
+          events={activeEvents}
+        />
 
-      <footer>
-        <span>AEROMIND / AUTONOMOUS MISSION VALIDATION CONSOLE</span>
-        <span>POLICY {VERIFIER_POLICY_VERSION.toUpperCase()}</span>
-      </footer>
-      <p className="disclaimer">
-        Simulation-only research prototype. Configured spatial and battery models
-        are synthetic engineering controls, not certified aircraft flight-control
-        software.
-      </p>
-    </main>
+        <footer className="console-footer">
+          <span>
+            AeroMind Simulation & Validation Prototype — Gemini proposes
+            symbolic plans; deterministic systems verify spatial and energy
+            bounds.
+          </span>
+          <span>
+            Synthetic simulation only. Not certified for physical aircraft
+            control.
+          </span>
+        </footer>
+      </main>
+    </div>
   );
 }

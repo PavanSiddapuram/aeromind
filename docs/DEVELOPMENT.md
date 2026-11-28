@@ -1,62 +1,44 @@
 # Local Development
 
 ## Requirements
+
 - Node.js 22 or newer
 - npm 10 or newer
 - Git
-- A browser with WebGL enabled for the Three.js scene
-
-A Gemini API key is not needed to run the current local scaffold. It will be required when the Gemini planner is integrated.
+- A browser with WebGL enabled for the Three.js simulation viewport
+- Optional: `GEMINI_API_KEY` in `.env` for live Gemini mission planning (deterministic automated tests run offline without credentials)
 
 ## Setup
 
-    git clone https://github.com/PavanSiddapuram/aeromind.git
-    cd aeromind
-    cp .env.example .env
-    npm install
-    npm run dev
+```bash
+git clone https://github.com/PavanSiddapuram/aeromind.git
+cd aeromind
+cp .env.example .env
+# Edit .env to set GEMINI_API_KEY=<your-server-key> (keep GEMINI_MODEL=gemini-3.8-flash or another supported model)
+npm ci
+npm run dev
+```
 
-The API runs on port 8080. The Vite client runs on port 5173 and proxies /api requests to the API.
+`npm run dev` compiles `@aeromind/shared` first and then runs three concurrent processes:
+- `@aeromind/shared` TypeScript compiler in watch mode
+- `@aeromind/server` Fastify API + SSE server on `http://localhost:8080`
+- `@aeromind/web` Vite dev server on `http://localhost:5173` (proxying `/api` to `http://localhost:8080`)
 
-Open http://localhost:5173. You should see the AeroMind shell and procedural Three.js flood-zone preview. Drag to orbit and scroll to zoom. The API endpoint can also be checked directly at http://localhost:8080/api/health.
+Never place `GEMINI_API_KEY` in a `VITE_`-prefixed variable or commit `.env` to Git.
 
-## Useful commands
+## Commands
 
-    npm run dev
-    npm run dev:api
-    npm run dev:web
-    npm run typecheck
-    npm run build
-    npm test
+```bash
+npm ci                                             # Clean reproducible install from package-lock.json
+npm run dev                                        # Start full local development stack
+npm run typecheck                                  # Typecheck shared, server (including tests), and web
+npm test                                           # Run deterministic unit, regression, API & E2E suites
+npm run build                                      # Build shared, server, and Vite static bundle
+npm run smoke:gemini --workspace @aeromind/server  # Run opt-in live Gemini smoke test (requires GEMINI_API_KEY)
+```
 
-After the first install, commit the generated package-lock.json so local and CI dependency resolution are repeatable.
+## Verification boundaries
 
-## Implemented
-
-- npm workspaces and strict TypeScript configuration
-- React/Vite application shell
-- Fastify API startup and GET /api/health
-- Production static asset serving when apps/web/dist exists
-- Shared domain types
-- Vector3 operations: add, subtract, scalar multiply/divide, dot, cross, length, distance, normalization, interpolation and approximate equality
-- Validated AABB representation, expansion, point containment and AABB overlap
-- Slab-based segment/AABB intersection (face/edge/corner contact is conservatively treated as collision)
-- Unit tests for vector math, AABB expansion and segment intersection
-- Procedural Three.js scene preview: synthetic flooded ground plane, seven building volumes, rooftop markers, home pad, quadcopter visual, animated rotors, dashed illustrative route, lighting and orbit controls
-
-## Explicit limitations
-
-The scene route and telemetry are visual fixtures. They are not produced by A*, Gemini or the verifier. The drone does not follow a mission or respond to a physical model. Buildings in the scene are not yet sourced from a canonical collision-world scenario.
-
-Not yet implemented:
-- Canonical scenario model shared between renderer and verifier
-- Navigation graph and A*
-- Route-level collision/geofence/altitude verification
-- Energy estimator
-- Gemini planner and real API integration
-- Mission orchestrator, state machine and version-bound execution gate
-- SSE mission events
-- Judge chaos panel
-- End-to-end tests and Cloud Run release validation
-
-Do not describe the current preview as an autonomous drone or a functioning rescue planner.
+- **Offline deterministic (`npm test`)**: Exercises vector math, AABB/segment collisions, canonical scenario invariants, 3D A* and RTH routing, energy estimation, `verifyRoute`, Zod/allowlist plan validation, state machine transitions, `ApprovalGate`, all 10 remaining-route recovery stages, REST error/tampering handling, static serving, and SSE streaming using injected test planners.
+- **Live Gemini (`npm run smoke:gemini --workspace @aeromind/server`)**: Exercises real `@google/genai` network authentication, structured JSON generation, allowlist validation, A* resolution, deterministic verification, and approval issuance.
+- **Prototype boundary**: In-memory mission state resets when the server restarts. Geometry (expanded AABBs) and battery models (configurable percentage-point coefficients) are conservative simulation controls, not real-aircraft flight guarantees.

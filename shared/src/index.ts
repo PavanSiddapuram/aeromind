@@ -70,6 +70,7 @@ export type ViolationCode =
 export type RouteViolation = {
   code: ViolationCode;
   message: string;
+  leg?: "outbound" | "return" | undefined;
   segmentIndex?: number | undefined;
   point?: Vector3 | undefined;
   entityId?: string | undefined;

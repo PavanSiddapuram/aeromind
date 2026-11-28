@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, Camera, Compass, RadioTower, ShieldAlert } from "lucide-react";
+import { AlertTriangle, RotateCcw } from "lucide-react";
 import {
   FLOOD_SCENARIO,
   resolvePreviewWaypoints,
@@ -11,9 +11,11 @@ import {
   type Vector3,
 } from "@aeromind/shared";
 import { AeroMindScene, type RouteVisualMode } from "../scene/AeroMindScene";
+import { formatHeadingDegrees, type ExecutionLeg } from "../types";
 
 export type DroneSimulationProps = {
   missionStatus?: MissionStatus | undefined;
+  activeLeg?: ExecutionLeg | null | undefined;
   environmentVersion?: number | undefined;
   drone?: DroneState | undefined;
   headingRad?: number | undefined;
@@ -28,9 +30,10 @@ export type DroneSimulationProps = {
 
 export default function DroneSimulation({
   missionStatus = "idle",
+  activeLeg = null,
   environmentVersion = 1,
   drone = FLOOD_SCENARIO.initialDrone,
-  headingRad,
+  headingRad = 0,
   obstacles = FLOOD_SCENARIO.obstacles,
   targets = FLOOD_SCENARIO.targets,
   waypoints,
@@ -79,7 +82,7 @@ export default function DroneSimulation({
     if (!scene) return;
     const activeWaypoints = waypoints ?? resolvePreviewWaypoints(FLOOD_SCENARIO);
     scene.setRoute(activeWaypoints, routeMode, returnWaypoints);
-    scene.setViolations(violations, activeWaypoints);
+    scene.setViolations(violations, activeWaypoints, returnWaypoints);
   }, [waypoints, returnWaypoints, routeMode, violations]);
 
   useEffect(() => {
@@ -92,60 +95,156 @@ export default function DroneSimulation({
     );
   }, [drone.position, headingRad, missionStatus]);
 
+  const headingDeg = formatHeadingDegrees(headingRad);
+  const dynamicObstacleCount = obstacles.filter(
+    (o) => o.kind === "dynamic_hazard",
+  ).length;
+
   return (
-    <section className="simulation-section">
-      <div className="section-heading">
-        <div>
-          <div className="panel-kicker">LIVE ENVIRONMENT / CANONICAL SCENARIO</div>
-          <h2>{FLOOD_SCENARIO.name}</h2>
+    <section
+      className="card viewport-card"
+      aria-label="3D mission simulation viewport"
+    >
+      <div className="viewport-toolbar">
+        <div className="viewport-title-group">
+          <h2 className="card-title">{FLOOD_SCENARIO.name}</h2>
+          <span className="viewport-meta">
+            World frame: X East · Y Altitude · Z North (metres) · Envelope{" "}
+            {(
+              drone.radiusMeters + FLOOD_SCENARIO.safetyClearanceMeters
+            ).toFixed(1)}{" "}
+            m
+          </span>
         </div>
-        <div className="scene-controls-hint">
-          <Compass size={14} /> Drag to orbit · Scroll to zoom
+
+        <div className="viewport-actions">
+          {activeLeg && (
+            <span className="badge badge-neutral">
+              Leg: {activeLeg === "return" ? "Return-to-Home" : "Outbound"}
+            </span>
+          )}
+          <span className="viewport-hint">Drag to orbit · Scroll to zoom</span>
+          <button
+            type="button"
+            className="btn btn-tonal btn-sm"
+            onClick={() => sceneRef.current?.resetCameraView()}
+            aria-label="Reset 3D camera view"
+          >
+            <RotateCcw size={13} aria-hidden="true" />
+            Reset view
+          </button>
         </div>
       </div>
 
       <div className="simulation-frame">
         <div className="scene-canvas" ref={containerRef}>
           {sceneError && (
-            <div className="scene-fallback">
-              <AlertTriangle size={22} />
-              <strong>3D renderer unavailable</strong>
+            <div className="scene-fallback" role="alert">
+              <AlertTriangle size={22} aria-hidden="true" />
+              <strong>3D visualization unavailable</strong>
               <span>{sceneError}</span>
-              <span>Enable WebGL or use a browser with hardware acceleration.</span>
+              <span>
+                Enable WebGL or open the console in a hardware-accelerated
+                browser.
+              </span>
             </div>
           )}
         </div>
 
-        <div className="scene-overlay scene-overlay-top">
-          <span className="live-indicator">
-            <i /> STATUS / {missionStatus.toUpperCase()}
-          </span>
-          <span>
-            SCENARIO / {FLOOD_SCENARIO.id.toUpperCase()} · ENV v{environmentVersion}
-          </span>
-        </div>
-
-        <div className="scene-overlay scene-overlay-bottom">
-          <span>
-            <RadioTower size={13} /> DRONE / {drone.id} (R={drone.radiusMeters}m + {FLOOD_SCENARIO.safetyClearanceMeters}m CLEARANCE)
-          </span>
-          <span>
-            <Camera size={13} /> POS ({drone.position.x.toFixed(0)}, {drone.position.y.toFixed(1)}, {drone.position.z.toFixed(0)})
-          </span>
-          <span>
-            ALT {drone.position.y.toFixed(1)} M · BAT {drone.batteryPercent.toFixed(1)}%
-          </span>
-          {violations.length > 0 && (
-            <span className="overlay-alert">
-              <ShieldAlert size={13} /> {violations.length} VIOLATION{violations.length === 1 ? "" : "S"}
+        {/* Restrained, solid-surface telemetry strip inside the dark 3D viewport */}
+        <div className="viewport-hud" aria-live="polite">
+          <div className="hud-group">
+            <span className="hud-item">
+              <span className="hud-label">Drone</span>
+              <strong className="mono">{drone.id}</strong>
             </span>
-          )}
+            <span className="hud-sep" aria-hidden="true" />
+            <span className="hud-item">
+              <span className="hud-label">Pos</span>
+              <strong className="mono tabular">
+                ({drone.position.x.toFixed(1)}, {drone.position.y.toFixed(1)},{" "}
+                {drone.position.z.toFixed(1)})
+              </strong>
+            </span>
+            <span className="hud-sep" aria-hidden="true" />
+            <span className="hud-item">
+              <span className="hud-label">Hdg</span>
+              <strong className="mono tabular">{headingDeg}°</strong>
+            </span>
+          </div>
+
+          <div className="hud-group">
+            <span className="hud-item">
+              <span className="hud-label">Alt</span>
+              <strong className="mono tabular">
+                {drone.position.y.toFixed(1)} m
+              </strong>
+            </span>
+            <span className="hud-sep" aria-hidden="true" />
+            <span className="hud-item">
+              <span className="hud-label">Battery</span>
+              <strong className="mono tabular">
+                {drone.batteryPercent.toFixed(1)}%
+              </strong>
+            </span>
+            <span className="hud-sep" aria-hidden="true" />
+            <span className="hud-item">
+              <span className="hud-label">Env</span>
+              <strong className="mono tabular">v{environmentVersion}</strong>
+            </span>
+            {dynamicObstacleCount > 0 && (
+              <>
+                <span className="hud-sep" aria-hidden="true" />
+                <span className="hud-item hud-warn">
+                  +{dynamicObstacleCount} Hazard
+                  {dynamicObstacleCount > 1 ? "s" : ""}
+                </span>
+              </>
+            )}
+            {violations.length > 0 && (
+              <>
+                <span className="hud-sep" aria-hidden="true" />
+                <span className="hud-item hud-danger">
+                  {violations.length} Violation
+                  {violations.length > 1 ? "s" : ""}
+                </span>
+              </>
+            )}
+          </div>
         </div>
       </div>
-      <p className="scene-caption">
-        Rendered and verified from the same world-space scenario contract (metres, Y=altitude).
-        Red volume marks restricted airspace ({FLOOD_SCENARIO.noFlyZones[0]?.id ?? "NFZ-01"}).
-      </p>
+
+      {/* Clear 3D Visual Legend */}
+      <div className="viewport-legend" aria-label="3D visualization legend">
+        <span className="legend-item">
+          <i className="legend-swatch swatch-approved" aria-hidden="true" />
+          Approved outbound
+        </span>
+        <span className="legend-item">
+          <i className="legend-swatch swatch-rth" aria-hidden="true" />
+          Return-to-home (RTH)
+        </span>
+        <span className="legend-item">
+          <i className="legend-swatch swatch-rejected" aria-hidden="true" />
+          Rejected / violation
+        </span>
+        <span className="legend-item">
+          <i className="legend-dot dot-pending" aria-hidden="true" />
+          Pending target
+        </span>
+        <span className="legend-item">
+          <i className="legend-dot dot-visited" aria-hidden="true" />
+          Visited target
+        </span>
+        <span className="legend-item">
+          <i className="legend-box box-nfz" aria-hidden="true" />
+          No-fly zone ({FLOOD_SCENARIO.noFlyZones[0]?.id ?? "NFZ-01"})
+        </span>
+        <span className="legend-item">
+          <i className="legend-box box-hazard" aria-hidden="true" />
+          Dynamic obstacle
+        </span>
+      </div>
     </section>
   );
 }

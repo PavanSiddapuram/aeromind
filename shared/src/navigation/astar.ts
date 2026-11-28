@@ -412,33 +412,35 @@ export function findShortestPath(
 }
 
 /**
- * Caching wrapper keyed by `environmentVersion` so environment mutations
- * automatically invalidate stale graph edge eligibility.
+ * Caching wrapper keyed by environment version and geometry parameters so
+ * environment mutations automatically invalidate stale edge eligibility.
  */
 export class VersionedNavigationEngine {
-  private cachedVersion: number | null = null;
-  private cachedMaxAltitude: number | null = null;
+  private cachedKey: string | null = null;
   private cachedGraph: CompiledNavigationGraph | null = null;
 
   getGraph(options: GraphBuildOptions): CompiledNavigationGraph {
-    if (
-      this.cachedGraph &&
-      this.cachedVersion === options.environmentVersion &&
-      this.cachedMaxAltitude === options.maxAltitudeMeters
-    ) {
+    const key = [
+      options.environmentVersion,
+      options.maxAltitudeMeters,
+      options.droneRadiusMeters,
+      options.safetyClearanceMeters,
+      options.obstacles.length,
+      options.noFlyZones.length,
+    ].join(":");
+
+    if (this.cachedGraph && this.cachedKey === key) {
       return this.cachedGraph;
     }
 
     const built = buildNavigationGraph(options);
-    this.cachedVersion = options.environmentVersion;
-    this.cachedMaxAltitude = options.maxAltitudeMeters;
+    this.cachedKey = key;
     this.cachedGraph = built;
     return built;
   }
 
   invalidate(): void {
-    this.cachedVersion = null;
-    this.cachedMaxAltitude = null;
+    this.cachedKey = null;
     this.cachedGraph = null;
   }
 }
@@ -510,7 +512,7 @@ export function resolveMissionRoute(params: {
 
   for (const targetId of targetOrder) {
     const target = targetById.get(targetId);
-    if (!target || target.status === "abandoned") {
+    if (!target || target.status !== "pending") {
       return {
         ok: false,
         code: "UNKNOWN_TARGET",
@@ -526,9 +528,32 @@ export function resolveMissionRoute(params: {
     drone.position,
   );
 
-  // If no targets are requested (e.g. safe return to base), route back to homeBase.
+  // Pure Return-to-Home resolution when no pending outbound targets remain:
+  // outbound mission distance is 0 and travel is represented exclusively in returnWaypoints.
   if (orderedGoalNodes.length === 0) {
-    orderedGoalNodes.push({ nodeId: scenario.homeBase.nodeId });
+    const rthOnly = findShortestPath(graph, startNodeId, scenario.homeBase.nodeId);
+    if (!rthOnly.ok) {
+      return {
+        ok: false,
+        code: "UNREACHABLE",
+        message: `Return-to-home route from ${startNodeId} to ${scenario.homeBase.nodeId} is blocked`,
+      };
+    }
+
+    return {
+      ok: true,
+      route: {
+        routeId,
+        nodeIds: [startNodeId],
+        waypoints: [{ ...drone.position }],
+        returnNodeIds: rthOnly.nodeIds,
+        returnWaypoints: rthOnly.waypoints,
+        targetIds: [],
+        distanceMeters: 0,
+        returnDistanceMeters: rthOnly.distanceMeters,
+        environmentVersion,
+      },
+    };
   }
 
   const buildChain = (
@@ -568,7 +593,7 @@ export function resolveMissionRoute(params: {
       currentId = goal.nodeId;
     }
 
-    // Ensure polyline has at least 2 points even when drone is already at the only goal.
+    // If drone is already positioned at the sole target, preserve a stationary dwell segment.
     if (allWaypoints.length === 1 && allWaypoints[0]) {
       allWaypoints.push({ ...allWaypoints[0] });
     }
@@ -606,7 +631,11 @@ export function resolveMissionRoute(params: {
       const hintedChain = buildChain([...advisoryHints, ...orderedGoalNodes]);
       if (
         hintedChain.ok &&
-        hintedChain.distanceMeters <= Math.max(chosenChain.distanceMeters * 1.35, chosenChain.distanceMeters + 25)
+        hintedChain.distanceMeters <=
+          Math.max(
+            chosenChain.distanceMeters * 1.35,
+            chosenChain.distanceMeters + 25,
+          )
       ) {
         chosenChain = hintedChain;
       }
@@ -628,13 +657,6 @@ export function resolveMissionRoute(params: {
     };
   }
 
-  const returnWaypoints =
-    rthLeg.waypoints.length >= 2
-      ? rthLeg.waypoints
-      : rthLeg.waypoints[0]
-        ? [{ ...rthLeg.waypoints[0] }, { ...rthLeg.waypoints[0] }]
-        : [];
-
   return {
     ok: true,
     route: {
@@ -642,7 +664,7 @@ export function resolveMissionRoute(params: {
       nodeIds: chosenChain.nodeIds,
       waypoints: chosenChain.waypoints,
       returnNodeIds: rthLeg.nodeIds,
-      returnWaypoints,
+      returnWaypoints: rthLeg.waypoints,
       targetIds: [...targetOrder],
       distanceMeters: chosenChain.distanceMeters,
       returnDistanceMeters: rthLeg.distanceMeters,

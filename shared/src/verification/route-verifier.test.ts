@@ -179,4 +179,42 @@ describe("deterministic route verifier", () => {
     expect(report.approved).toBe(false);
     expect(report.violations.length).toBeGreaterThan(0);
   });
+
+  it("verifies a return-only route accounting for return energy once and zero outbound/dwell energy", () => {
+    const scenario = cloneScenarioSnapshot(FLOOD_SCENARIO);
+    const roof02 = scenario.targets.find((t) => t.id === "ROOF-02")!;
+    const resolved = resolveMissionRoute({
+      routeId: "route-rth-verify",
+      environmentVersion: 1,
+      scenario,
+      obstacles: scenario.obstacles,
+      targets: scenario.targets,
+      drone: { ...scenario.initialDrone, position: { ...roof02.position }, batteryPercent: 60 },
+      constraints: scenario.defaultConstraints,
+      targetOrder: [],
+    });
+
+    expect(resolved.ok).toBe(true);
+    if (!resolved.ok) return;
+
+    const report = verifyRoute({
+      routeId: resolved.route.routeId,
+      environmentVersion: 1,
+      waypoints: resolved.route.waypoints,
+      returnWaypoints: resolved.route.returnWaypoints,
+      inspectedTargetCount: 0,
+      executionLeg: "return",
+      drone: { ...scenario.initialDrone, position: { ...roof02.position }, batteryPercent: 60 },
+      constraints: scenario.defaultConstraints,
+      scenario,
+    });
+
+    expect(report.approved).toBe(true);
+    expect(report.estimatedMissionEnergyPercent).toBe(0);
+    expect(report.estimatedReturnEnergyPercent).toBeGreaterThan(0);
+    expect(report.projectedLandingReservePercent).toBeCloseTo(
+      60 - report.estimatedReturnEnergyPercent,
+      5,
+    );
+  });
 });

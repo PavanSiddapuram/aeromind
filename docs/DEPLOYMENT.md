@@ -1,6 +1,6 @@
 # Deployment — Google Cloud Run
 
-Status: Dockerfile and single-container build path are present. The first application release still requires local build validation and a real Cloud Run smoke test.
+Status: **Deployed and verified on Google Cloud Run (`asia-south1`)** at https://aeromind-769443186508.asia-south1.run.app (`aeromind-gemini-sprint`, Secret Manager `GEMINI_API_KEY`, least-privilege `aeromind-runner` service account, `--max-instances=1`, `--session-affinity`).
 
 ## 1. Target topology
 

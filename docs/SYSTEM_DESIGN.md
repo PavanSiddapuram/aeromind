@@ -57,8 +57,8 @@ The orchestrator also owns the state machine, retry budget and event publication
 1. Client submits mission request and scenario identifier.
 2. Backend loads and validates canonical scenario snapshot.
 3. Backend creates mission version and emits mission.received.
-4. Gemini receives mission text, constraints, target catalogue and valid navigation-node catalogue. Image context is optional and event-triggered.
-5. Gemini returns a schema-constrained proposal referencing known IDs only.
+4. Gemini receives mission text, scalar mission telemetry/constraints (battery percentage, current altitude, wind speed, max altitude, minimum landing reserve, energy coefficients), and discrete catalogues of known target IDs and navigation-node IDs. Optional event/operator-triggered scene JPEG context is bounded on the server. Gemini never authors authoritative XYZ flight coordinates.
+5. Gemini returns a schema-constrained proposal referencing known target and node IDs only.
 6. Backend performs schema and domain validation; unknown IDs, invalid constraints or impossible target references are rejected.
 7. Navigation resolves target sequence into graph paths and world-space waypoints.
 8. Verifier checks the exact path to be executed: obstacle clearance, geofences, altitude and energy.
@@ -115,17 +115,20 @@ Use a transparent configurable model, not a physical battery simulator:
 
 All terms use battery percentage points. Coefficients are scenario configuration and must be visible in documentation/UI. Recompute from current drone state after every material event. Never imply calibrated real aircraft performance.
 
-## 10. Replanning policy
+## 10. Replanning and remaining-route policy
 
-1. Pause simulation on material environment change.
-2. Increment environment version.
-3. Revoke approvals bound to prior environment version.
-4. Verify remaining route against new environment.
-5. Try deterministic local reroute to the same target.
-6. If no feasible route exists, or target ordering/resource trade-offs change, ask Gemini for a revised proposal.
-7. Validate response, resolve route and verify again.
-8. Maximum two Gemini repair attempts per trigger.
-9. If no plan is approved, enter safe hold or a prevalidated scenario fallback. No fallback bypasses verification.
+1. Validate incoming environment mutations atomically before changing state; invalid mutations return `400` without pausing execution, bumping `environmentVersion`, or revoking approvals.
+2. Pause active simulation on material environment change (`EXECUTING -> PAUSED`).
+3. Increment `environmentVersion` and invalidate cached graph eligibility.
+4. Revoke approvals bound to prior environment versions.
+5. Derive the exact stage-aware remaining trajectory (`deriveRemainingMissionRoute`):
+   - `READY` before execution: full planned outbound path + full RTH path.
+   - `EXECUTING`/`PAUSED` on outbound leg: live 3D drone position + unflown outbound waypoints + still-pending targets + RTH path (excluding already-visited targets and completed segments).
+   - `EXECUTING`/`PAUSED` on return-to-home leg (or all targets visited): `0 m` outbound leg + live 3D drone position through remaining RTH waypoints to `N-BASE` (`0` target dwell).
+6. Re-verify the derived remaining trajectory against the mutated environment.
+7. Tier 1: Try deterministic local A* reroute to the same remaining pending targets (or pure RTH to `N-BASE` when `0` targets remain) with zero Gemini calls.
+8. Tier 2: If pending targets remain and local routing is unreachable or energy-infeasible (or a new priority target was discovered), ask Gemini for a revised proposal with structured violation/unreachability details (maximum two repair attempts per trigger). Target abandonments (`abortedObjectives`) are committed only once a candidate route passes verification.
+9. Fallback: If no route is approved within the retry budget (or RTH itself is blocked/infeasible), enter `SAFE_HOLD` with zero execution approval.
 
 ## 11. Failure handling
 

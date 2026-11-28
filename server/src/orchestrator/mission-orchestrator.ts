@@ -3,10 +3,13 @@ import {
   FLOOD_SCENARIO,
   VERIFIER_POLICY_VERSION,
   VersionedNavigationEngine,
+  assertValidAABB,
   cloneScenarioSnapshot,
+  containsPoint,
   distance,
   equals,
   getScenarioDefinition,
+  isFiniteVector3,
   lerp,
   resolveMissionRoute,
   verifyRoute,
@@ -31,23 +34,30 @@ import type { MissionPlanner } from "../planner/gemini-planner.js";
 import { PlannerProviderError } from "../planner/gemini-planner.js";
 import { validateMissionPlanAgainstScenario } from "../planner/plan-validator.js";
 import { ApprovalGate } from "./approval-gate.js";
+import {
+  deriveRemainingMissionRoute,
+  type ExecutionLeg,
+  type FlightProgressState,
+} from "./remaining-route.js";
 import { assertLegalTransition } from "./state-machine.js";
 
 export const MAX_GEMINI_REPAIR_ATTEMPTS = 2;
+const MAX_STORED_SESSIONS = 200;
 
-export type ReplanOutcome = "none" | "unchanged_valid" | "local_astar" | "ai_replan" | "safe_hold";
+export type ReplanOutcome =
+  | "none"
+  | "unchanged_valid"
+  | "local_astar"
+  | "ai_replan"
+  | "safe_hold";
 
-export type FlightProgress = {
-  leg: "outbound" | "return";
-  segmentIndex: number;
-  segmentOffsetMeters: number;
-  headingRad: number;
-};
+export type FlightProgress = FlightProgressState;
 
 export type MissionSnapshot = {
   missionId: string;
   scenarioId: string;
   status: MissionStatus;
+  activeLeg: ExecutionLeg | null;
   instruction: string;
   constraints: MissionConstraints;
   environmentVersion: number;
@@ -102,6 +112,8 @@ type MissionSession = {
 };
 
 export type EventSubscriber = (event: MissionEvent) => void;
+
+type PreparedMutation = (session: MissionSession) => void;
 
 export class MissionOrchestrator {
   private readonly sessions = new Map<string, MissionSession>();
@@ -167,7 +179,10 @@ export class MissionOrchestrator {
     return session ? session.events.map((e) => structuredClone(e)) : [];
   }
 
-  resetMission(missionId: string, scenarioId = FLOOD_SCENARIO.id): MissionSnapshot {
+  resetMission(
+    missionId: string,
+    scenarioId = FLOOD_SCENARIO.id,
+  ): MissionSnapshot {
     const existing = this.sessions.get(missionId);
     if (existing?.simTimer) {
       clearInterval(existing.simTimer);
@@ -184,9 +199,24 @@ export class MissionOrchestrator {
       );
     }
 
+    if (!this.sessions.has(missionId)) {
+      this.evictOldestIdleSessionIfNeeded();
+    }
     const fresh = this.createSession(missionId, definition);
     this.sessions.set(missionId, fresh);
     return this.toSnapshot(fresh);
+  }
+
+  private evictOldestIdleSessionIfNeeded(): void {
+    if (this.sessions.size < MAX_STORED_SESSIONS) return;
+    for (const [id, candidate] of this.sessions) {
+      if (candidate.status !== "executing") {
+        this.stopSimulationTicker(candidate);
+        this.approvalGate.revokeMissionApprovals(id);
+        this.sessions.delete(id);
+        return;
+      }
+    }
   }
 
   async planMission(params: {
@@ -215,6 +245,7 @@ export class MissionOrchestrator {
           `New mission "${params.missionId}" starts at environment version 1 (received ${params.expectedEnvironmentVersion}).`,
         );
       }
+      this.evictOldestIdleSessionIfNeeded();
       session = this.createSession(params.missionId, definition);
       this.sessions.set(params.missionId, session);
     }
@@ -239,6 +270,8 @@ export class MissionOrchestrator {
       this.stopSimulationTicker(session);
       this.approvalGate.revokeMissionApprovals(session.missionId);
       session.approval = null;
+      session.executedRoute = null;
+      session.flightProgress = null;
       session.lastRejectedVerification = null;
       session.lastRejectedWaypoints = null;
       session.lastReplanOutcome = "none";
@@ -303,16 +336,28 @@ export class MissionOrchestrator {
         );
       }
 
+      const derived = deriveRemainingMissionRoute({
+        drone: session.drone,
+        scenario: session.scenario,
+        targets: session.targets,
+        plan: session.plan,
+        route: session.route,
+        executedRoute: session.executedRoute,
+        flightProgress: session.flightProgress,
+      });
+
       this.emitEvent(session, "verification.started", {
         routeId: session.route.routeId,
+        leg: derived.leg,
       });
 
       const report = verifyRoute({
         routeId: session.route.routeId,
         environmentVersion: session.environmentVersion,
-        waypoints: session.route.waypoints,
-        returnWaypoints: session.route.returnWaypoints,
-        inspectedTargetCount: session.route.targetIds.length,
+        waypoints: derived.outboundWaypoints,
+        returnWaypoints: derived.returnWaypoints,
+        inspectedTargetCount: derived.inspectedTargetCount,
+        executionLeg: derived.leg,
         drone: session.drone,
         constraints: session.constraints,
         scenario: session.scenario,
@@ -324,6 +369,19 @@ export class MissionOrchestrator {
       session.verification = report;
 
       if (report.approved) {
+        // Commit the derived remaining route so subsequent execution starts cleanly at drone.position.
+        session.route = {
+          ...session.route,
+          waypoints: derived.outboundWaypoints,
+          returnWaypoints: derived.returnWaypoints,
+          targetIds: derived.remainingTargetIds,
+          distanceMeters: derived.outboundDistanceMeters,
+          returnDistanceMeters: derived.returnDistanceMeters,
+          environmentVersion: session.environmentVersion,
+        };
+        session.executedRoute = null;
+        session.flightProgress = null;
+
         if (session.status !== "ready" && session.status !== "executing") {
           this.transition(session, "ready");
         }
@@ -344,7 +402,7 @@ export class MissionOrchestrator {
         this.approvalGate.revokeMissionApprovals(session.missionId);
         session.approval = null;
         session.lastRejectedVerification = report;
-        session.lastRejectedWaypoints = [...session.route.waypoints];
+        session.lastRejectedWaypoints = derived.combinedTrajectory;
         this.emitEvent(session, "verification.rejected", {
           routeId: session.route.routeId,
           violations: report.violations,
@@ -373,14 +431,6 @@ export class MissionOrchestrator {
     const session = this.requireSession(params.missionId);
 
     return this.runExclusive(session, async () => {
-      if (!session.route || session.route.routeId !== params.routeId) {
-        throw new AppHttpError(
-          404,
-          "ROUTE_NOT_FOUND",
-          `Route "${params.routeId}" was not found for mission "${params.missionId}".`,
-        );
-      }
-
       const consumedApproval = this.approvalGate.authorizeExecution({
         missionId: session.missionId,
         routeId: params.routeId,
@@ -391,10 +441,22 @@ export class MissionOrchestrator {
         missionStatus: session.status,
       });
 
+      if (!session.route || session.route.routeId !== params.routeId) {
+        throw new AppHttpError(
+          404,
+          "ROUTE_NOT_FOUND",
+          `Route "${params.routeId}" was not found for mission "${params.missionId}".`,
+        );
+      }
+
+      const isReturnOnlyRoute =
+        session.route.targetIds.length === 0 &&
+        session.route.waypoints.length <= 1;
+
       session.approval = consumedApproval;
       session.executedRoute = structuredClone(session.route);
       session.flightProgress = {
-        leg: "outbound",
+        leg: isReturnOnlyRoute ? "return" : "outbound",
         segmentIndex: 0,
         segmentOffsetMeters: 0,
         headingRad: session.headingRad,
@@ -403,12 +465,16 @@ export class MissionOrchestrator {
       this.emitEvent(session, "execution.authorized", {
         routeId: session.route.routeId,
         approvalId: consumedApproval.approvalId,
+        leg: session.flightProgress.leg,
       });
 
       this.transition(session, "executing");
       this.emitEvent(session, "simulation.started", {
         routeId: session.route.routeId,
-        waypointCount: session.route.waypoints.length,
+        leg: session.flightProgress.leg,
+        waypointCount: isReturnOnlyRoute
+          ? session.route.returnWaypoints.length
+          : session.route.waypoints.length,
       });
 
       if (this.enableAutoTicker) {
@@ -437,8 +503,19 @@ export class MissionOrchestrator {
         );
       }
 
+      // Validate the mutation payload BEFORE pausing, bumping version, or revoking approvals
+      // so invalid mutations fail atomically with zero partial state mutation.
+      const applyValidatedMutation = this.prepareValidatedMutation(
+        session,
+        params.event,
+      );
+
       const wasExecuting = session.status === "executing";
-      const hadPlan = session.plan !== null;
+      const canAutoRecover =
+        session.plan !== null &&
+        session.status !== "completed" &&
+        session.status !== "aborted" &&
+        session.status !== "failed";
 
       // INV-07: Pause execution immediately, bump environmentVersion, revoke prior approvals.
       this.stopSimulationTicker(session);
@@ -446,11 +523,14 @@ export class MissionOrchestrator {
         this.transition(session, "paused");
         this.emitEvent(session, "simulation.paused", {
           reason: params.event.type,
+          leg: session.flightProgress?.leg ?? "outbound",
           dronePosition: { ...session.drone.position },
           batteryPercent: session.drone.batteryPercent,
         });
-      } else if (session.status === "ready") {
-        this.transition(session, "paused");
+      } else if (session.status === "ready" || session.status === "safe_hold") {
+        if (session.status === "ready") {
+          this.transition(session, "paused");
+        }
       }
 
       session.environmentVersion += 1;
@@ -464,7 +544,7 @@ export class MissionOrchestrator {
         );
       }
 
-      this.applyMutationToSession(session, params.event);
+      applyValidatedMutation(session);
 
       this.emitEvent(session, "environment.changed", {
         mutation: params.event,
@@ -472,9 +552,14 @@ export class MissionOrchestrator {
         batteryPercent: session.drone.batteryPercent,
       });
 
-      const shouldReplan = (params.autoReplan ?? true) && hadPlan;
+      const shouldReplan = (params.autoReplan ?? true) && canAutoRecover;
       if (!shouldReplan) {
         return this.toSnapshot(session);
+      }
+
+      if (session.status === "safe_hold") {
+        // Allow environment recovery (e.g. battery replenished or obstacle cleared) only via planning/verifying:
+        session.status = "paused";
       }
 
       await this.reVerifyAndRecoverAfterMutation(session, {
@@ -555,18 +640,16 @@ export class MissionOrchestrator {
         };
         plannerOutput = await this.planner.proposeMissionPlan(requestCtx);
       } catch (error) {
-        // INV-03: Gemini timeout / outage -> safe_hold, zero approval.
+        // INV-03: Planner timeout / outage -> safe_hold, zero approval.
         this.enterSafeHold(
           session,
           error instanceof Error ? error.message : "Planner unavailable",
         );
         if (options.isInitialRequest && error instanceof PlannerProviderError) {
-          throw new AppHttpError(
-            503,
-            error.code,
-            error.message,
-            { missionId: session.missionId, status: session.status },
-          );
+          throw new AppHttpError(503, error.code, error.message, {
+            missionId: session.missionId,
+            status: session.status,
+          });
         }
         return;
       }
@@ -613,15 +696,7 @@ export class MissionOrchestrator {
       }
 
       const plan = validation.plan;
-      session.plan = plan;
       priorPlan = plan;
-
-      for (const abortedId of plan.abortedObjectives) {
-        const target = session.targets.find((t) => t.id === abortedId);
-        if (target && target.status === "pending") {
-          target.status = "abandoned";
-        }
-      }
 
       this.emitEvent(session, "plan.generated", {
         latencyMs: plannerOutput.latencyMs,
@@ -632,6 +707,8 @@ export class MissionOrchestrator {
       });
 
       if (plan.missionStatus === "aborted") {
+        session.plan = plan;
+        this.commitAbortedObjectives(session, plan.abortedObjectives);
         this.enterSafeHold(
           session,
           `Planner aborted mission objectives: ${plan.decisionSummary}`,
@@ -661,7 +738,6 @@ export class MissionOrchestrator {
         continue;
       }
 
-      session.route = resolved.route;
       this.emitEvent(session, "route.resolved", {
         routeId: resolved.route.routeId,
         nodeIds: resolved.route.nodeIds,
@@ -682,6 +758,7 @@ export class MissionOrchestrator {
         waypoints: resolved.route.waypoints,
         returnWaypoints: resolved.route.returnWaypoints,
         inspectedTargetCount: resolved.route.targetIds.length,
+        executionLeg: "outbound",
         drone: session.drone,
         constraints: session.constraints,
         scenario: session.scenario,
@@ -693,6 +770,13 @@ export class MissionOrchestrator {
       session.verification = report;
 
       if (report.approved) {
+        // Commit plan, abandoned targets, and reset execution cursor only AFTER verification succeeds.
+        session.plan = plan;
+        this.commitAbortedObjectives(session, plan.abortedObjectives);
+        session.route = resolved.route;
+        session.executedRoute = null;
+        session.flightProgress = null;
+
         this.transition(session, "ready");
         const approval = this.approvalGate.issueApproval({
           missionId: session.missionId,
@@ -740,12 +824,7 @@ export class MissionOrchestrator {
       sceneImageDataUrl?: string | undefined;
     },
   ): Promise<void> {
-    const remainingTargetIds = (session.plan?.targetOrder ?? []).filter((id) => {
-      const target = session.targets.find((t) => t.id === id);
-      return target?.status === "pending";
-    });
-
-    // 1. If a new priority target was discovered, mission-level priorities changed -> invoke Gemini replan.
+    // 1. If a new priority target was discovered, mission-level priorities changed -> invoke AI replan.
     if (options.mutationType === "target.discovered") {
       await this.executePlanAndVerifyCycle(session, {
         isInitialRequest: false,
@@ -756,22 +835,53 @@ export class MissionOrchestrator {
       return;
     }
 
-    // 2. Re-verify the remaining segment of the existing route against the mutated environment.
+    let derived = session.route
+      ? deriveRemainingMissionRoute({
+          drone: session.drone,
+          scenario: session.scenario,
+          targets: session.targets,
+          plan: session.plan,
+          route: session.route,
+          executedRoute: session.executedRoute,
+          flightProgress: session.flightProgress,
+        })
+      : null;
+
+    const remainingTargetIds =
+      derived?.remainingTargetIds ??
+      (session.plan?.targetOrder ?? []).filter((id) => {
+        const target = session.targets.find((t) => t.id === id);
+        return target?.status === "pending";
+      });
+
+    // 2. Re-verify the exact remaining outbound/return trajectory against the mutated environment.
     let priorViolations: RouteViolation[] | undefined;
-    if (session.route) {
-      const remainingWaypoints = this.extractRemainingWaypoints(session);
+    if (session.route && derived) {
       this.transition(session, "verifying");
       this.emitEvent(session, "verification.started", {
         routeId: session.route.routeId,
+        leg: derived.leg,
         reason: "environment_mutation_recheck",
       });
 
-      const currentReport = verifyRoute({
-        routeId: session.route.routeId,
+      const refreshedRoute: ResolvedRoute = {
+        ...session.route,
+        routeId: `route-v${session.environmentVersion}-${randomUUID().slice(0, 8)}`,
+        waypoints: derived.outboundWaypoints,
+        returnWaypoints: derived.returnWaypoints,
+        targetIds: derived.remainingTargetIds,
+        distanceMeters: derived.outboundDistanceMeters,
+        returnDistanceMeters: derived.returnDistanceMeters,
         environmentVersion: session.environmentVersion,
-        waypoints: remainingWaypoints,
-        returnWaypoints: session.route.returnWaypoints,
-        inspectedTargetCount: remainingTargetIds.length,
+      };
+
+      const currentReport = verifyRoute({
+        routeId: refreshedRoute.routeId,
+        environmentVersion: session.environmentVersion,
+        waypoints: refreshedRoute.waypoints,
+        returnWaypoints: refreshedRoute.returnWaypoints,
+        inspectedTargetCount: derived.inspectedTargetCount,
+        executionLeg: derived.leg,
         drone: session.drone,
         constraints: session.constraints,
         scenario: session.scenario,
@@ -783,60 +893,42 @@ export class MissionOrchestrator {
       session.verification = currentReport;
 
       if (currentReport.approved) {
-        const refreshedRoute: ResolvedRoute = {
-          ...session.route,
-          routeId: `route-v${session.environmentVersion}-${randomUUID().slice(0, 8)}`,
-          waypoints: remainingWaypoints,
-          targetIds: remainingTargetIds,
-          environmentVersion: session.environmentVersion,
-        };
-        const refreshedReport = verifyRoute({
+        session.route = refreshedRoute;
+        session.executedRoute = null;
+        session.flightProgress = null;
+        this.transition(session, "ready");
+        session.approval = this.approvalGate.issueApproval({
+          missionId: session.missionId,
           routeId: refreshedRoute.routeId,
           environmentVersion: session.environmentVersion,
-          waypoints: refreshedRoute.waypoints,
-          returnWaypoints: refreshedRoute.returnWaypoints,
-          inspectedTargetCount: remainingTargetIds.length,
-          drone: session.drone,
-          constraints: session.constraints,
-          scenario: session.scenario,
-          obstacles: session.obstacles,
-          windMetersPerSecond: session.windMetersPerSecond,
           policyVersion: VERIFIER_POLICY_VERSION,
+          verification: currentReport,
         });
-        if (refreshedReport.approved) {
-          session.route = refreshedRoute;
-          session.verification = refreshedReport;
-          this.transition(session, "ready");
-          session.approval = this.approvalGate.issueApproval({
-            missionId: session.missionId,
-            routeId: refreshedRoute.routeId,
-            environmentVersion: session.environmentVersion,
-            policyVersion: VERIFIER_POLICY_VERSION,
-            verification: refreshedReport,
-          });
-          session.lastReplanOutcome = "unchanged_valid";
-          this.emitEvent(session, "verification.passed", {
-            routeId: refreshedRoute.routeId,
-            approvalId: session.approval.approvalId,
-            replanOutcome: "unchanged_valid",
-          });
-          return;
-        }
+        session.lastReplanOutcome = "unchanged_valid";
+        this.emitEvent(session, "verification.passed", {
+          routeId: refreshedRoute.routeId,
+          approvalId: session.approval.approvalId,
+          leg: derived.leg,
+          replanOutcome: "unchanged_valid",
+        });
+        return;
       }
 
       session.lastRejectedVerification = currentReport;
-      session.lastRejectedWaypoints = remainingWaypoints;
+      session.lastRejectedWaypoints = derived.combinedTrajectory;
       priorViolations = currentReport.violations;
       this.emitEvent(session, "verification.rejected", {
         routeId: session.route.routeId,
+        leg: derived.leg,
         violations: currentReport.violations,
       });
     }
 
-    // 3. Attempt deterministic local A* reroute FIRST without calling Gemini (SYSTEM_DESIGN §10.5).
+    // 3. Tier 1 — Attempt deterministic local A* reroute FIRST with zero AI calls (SYSTEM_DESIGN §10.5).
     this.transition(session, "repairing");
     this.emitEvent(session, "replanning.started", {
       mode: "local_astar",
+      leg: derived?.leg ?? "outbound",
       remainingTargets: remainingTargetIds,
     });
 
@@ -859,7 +951,11 @@ export class MissionOrchestrator {
         routeId: localResolved.route.routeId,
         mode: "local_astar",
         nodeIds: localResolved.route.nodeIds,
+        returnNodeIds: localResolved.route.returnNodeIds,
         distanceMeters: Number(localResolved.route.distanceMeters.toFixed(2)),
+        returnDistanceMeters: Number(
+          localResolved.route.returnDistanceMeters.toFixed(2),
+        ),
       });
 
       this.transition(session, "verifying");
@@ -867,12 +963,15 @@ export class MissionOrchestrator {
         routeId: localResolved.route.routeId,
       });
 
+      const localLeg: ExecutionLeg =
+        remainingTargetIds.length === 0 ? "return" : "outbound";
       const localReport = verifyRoute({
         routeId: localResolved.route.routeId,
         environmentVersion: session.environmentVersion,
         waypoints: localResolved.route.waypoints,
         returnWaypoints: localResolved.route.returnWaypoints,
         inspectedTargetCount: remainingTargetIds.length,
+        executionLeg: localLeg,
         drone: session.drone,
         constraints: session.constraints,
         scenario: session.scenario,
@@ -883,6 +982,8 @@ export class MissionOrchestrator {
 
       if (localReport.approved) {
         session.route = localResolved.route;
+        session.executedRoute = null;
+        session.flightProgress = null;
         session.verification = localReport;
         this.transition(session, "ready");
         session.approval = this.approvalGate.issueApproval({
@@ -896,6 +997,7 @@ export class MissionOrchestrator {
         this.emitEvent(session, "verification.passed", {
           routeId: localResolved.route.routeId,
           approvalId: session.approval.approvalId,
+          leg: localLeg,
           replanOutcome: "local_astar",
           projectedLandingReservePercent: Number(
             localReport.projectedLandingReservePercent.toFixed(2),
@@ -904,16 +1006,32 @@ export class MissionOrchestrator {
         return;
       }
 
+      session.verification = localReport;
       session.lastRejectedVerification = localReport;
-      session.lastRejectedWaypoints = [...localResolved.route.waypoints];
+      session.lastRejectedWaypoints =
+        localLeg === "return"
+          ? [...localResolved.route.returnWaypoints]
+          : [...localResolved.route.waypoints];
       priorViolations = localReport.violations;
       this.emitEvent(session, "verification.rejected", {
         routeId: localResolved.route.routeId,
+        leg: localLeg,
         violations: localReport.violations,
       });
     }
 
-    // 4. Local reroute was unreachable or energy-infeasible -> invoke bounded Gemini replanning (max 2 attempts).
+    // If zero pending targets remain (already on Return-to-Home), AI objective shedding cannot
+    // unblock a severed home corridor or restore return reserve -> fail closed into SAFE_HOLD.
+    if (remainingTargetIds.length === 0) {
+      const reason = !localResolved.ok
+        ? localResolved.message
+        : (priorViolations?.map((v) => v.message).join("; ") ??
+          "Return-to-home route failed verification.");
+      this.enterSafeHold(session, reason);
+      return;
+    }
+
+    // 4. Tier 2 — Local reroute was unreachable or energy-infeasible -> bounded AI replanning (max 2 attempts).
     await this.executePlanAndVerifyCycle(session, {
       isInitialRequest: false,
       priorViolations,
@@ -922,45 +1040,54 @@ export class MissionOrchestrator {
     });
   }
 
-  private extractRemainingWaypoints(session: MissionSession): Vector3[] {
-    if (!session.route) {
-      return [{ ...session.drone.position }, { ...session.drone.position }];
+  private commitAbortedObjectives(
+    session: MissionSession,
+    abortedIds: readonly string[],
+  ): void {
+    for (const abortedId of abortedIds) {
+      const target = session.targets.find((t) => t.id === abortedId);
+      if (target && target.status === "pending") {
+        target.status = "abandoned";
+      }
     }
-    const startIdx =
-      session.flightProgress?.leg === "outbound"
-        ? session.flightProgress.segmentIndex + 1
-        : session.route.waypoints.length - 1;
-    const tail = session.route.waypoints
-      .slice(Math.max(1, startIdx))
-      .map((p) => ({ ...p }));
-    if (tail.length === 0) {
-      const end =
-        session.route.waypoints[session.route.waypoints.length - 1] ??
-        session.drone.position;
-      return [{ ...session.drone.position }, { ...end }];
-    }
-    return [{ ...session.drone.position }, ...tail];
   }
 
-  private applyMutationToSession(
+  /**
+   * Validates an environment mutation completely before any session state, version,
+   * or approval is touched, guaranteeing strict atomicity on invalid inputs.
+   */
+  private prepareValidatedMutation(
     session: MissionSession,
     event: EnvironmentMutationEvent,
-  ): void {
+  ): PreparedMutation {
     switch (event.type) {
       case "obstacle.spawned": {
-        const preset =
+        const candidate =
           event.obstacle ??
           session.scenario.chaosObstaclePresets[event.obstacleId];
-        if (!preset) {
+        if (!candidate) {
           throw new AppHttpError(
             400,
             "UNKNOWN_OBSTACLE_PRESET",
             `Unknown obstacleId "${event.obstacleId}" and no explicit obstacle bounds supplied.`,
           );
         }
-        const filtered = session.obstacles.filter((o) => o.id !== preset.id);
-        session.obstacles = [...filtered, structuredClone(preset)];
-        break;
+        try {
+          assertValidAABB(candidate.bounds, `obstacle(${candidate.id})`);
+        } catch (error) {
+          throw new AppHttpError(
+            400,
+            "INVALID_OBSTACLE_BOUNDS",
+            error instanceof Error ? error.message : "Invalid obstacle bounds.",
+          );
+        }
+        const clonedObstacle = structuredClone(candidate);
+        return (targetSession) => {
+          const filtered = targetSession.obstacles.filter(
+            (o) => o.id !== clonedObstacle.id,
+          );
+          targetSession.obstacles = [...filtered, clonedObstacle];
+        };
       }
       case "battery.changed": {
         if (
@@ -974,38 +1101,59 @@ export class MissionOrchestrator {
             "batteryPercent must be between 0 and 100.",
           );
         }
-        session.drone = {
-          ...session.drone,
-          batteryPercent: event.batteryPercent,
+        const nextBattery = event.batteryPercent;
+        return (targetSession) => {
+          targetSession.drone = {
+            ...targetSession.drone,
+            batteryPercent: nextBattery,
+          };
         };
-        break;
       }
       case "target.discovered": {
-        const preset =
+        const candidate =
           event.target ??
           session.scenario.discoverableTargetPresets[event.targetId];
-        if (!preset) {
+        if (!candidate) {
           throw new AppHttpError(
             400,
             "UNKNOWN_TARGET_PRESET",
             `Unknown discoverable targetId "${event.targetId}".`,
           );
         }
-        const existingIdx = session.targets.findIndex(
-          (t) => t.id === preset.id,
-        );
-        if (existingIdx >= 0) {
-          session.targets[existingIdx] = {
-            ...structuredClone(preset),
-            status: "pending",
-          };
-        } else {
-          session.targets.push({
-            ...structuredClone(preset),
-            status: "pending",
-          });
+        if (
+          !isFiniteVector3(candidate.position) ||
+          !containsPoint(session.scenario.worldBounds, candidate.position, true)
+        ) {
+          throw new AppHttpError(
+            400,
+            "INVALID_TARGET_POSITION",
+            `Target "${candidate.id}" position is invalid or outside scenario bounds.`,
+          );
         }
-        break;
+        const nodeExists = session.scenario.nodes.some(
+          (n) => n.id === candidate.nodeId,
+        );
+        if (!nodeExists) {
+          throw new AppHttpError(
+            400,
+            "INVALID_TARGET_NODE",
+            `Target "${candidate.id}" references unknown graph node "${candidate.nodeId}".`,
+          );
+        }
+        const clonedTarget: RescueTarget = {
+          ...structuredClone(candidate),
+          status: "pending",
+        };
+        return (targetSession) => {
+          const existingIdx = targetSession.targets.findIndex(
+            (t) => t.id === clonedTarget.id,
+          );
+          if (existingIdx >= 0) {
+            targetSession.targets[existingIdx] = clonedTarget;
+          } else {
+            targetSession.targets.push(clonedTarget);
+          }
+        };
       }
       case "wind.changed": {
         if (
@@ -1019,8 +1167,10 @@ export class MissionOrchestrator {
             "windMetersPerSecond must be between 0 and 35.",
           );
         }
-        session.windMetersPerSecond = event.windMetersPerSecond;
-        break;
+        const nextWind = event.windMetersPerSecond;
+        return (targetSession) => {
+          targetSession.windMetersPerSecond = nextWind;
+        };
       }
     }
   }
@@ -1089,6 +1239,7 @@ export class MissionOrchestrator {
         } else {
           // Completed return-to-home leg!
           this.stopSimulationTicker(session);
+          session.flightProgress = null;
           this.transition(session, "completed");
           this.emitEvent(session, "simulation.completed", {
             finalBatteryPercent: Number(
@@ -1108,7 +1259,9 @@ export class MissionOrchestrator {
 
       const segLength = distance(segStart, segEnd);
       if (segLength <= 1e-6) {
-        this.markReachedTargetAtPoint(session, segEnd);
+        if (session.flightProgress.leg === "outbound") {
+          this.markReachedTargetAtPoint(session, segEnd);
+        }
         session.flightProgress.segmentIndex += 1;
         session.flightProgress.segmentOffsetMeters = 0;
         continue;
@@ -1287,10 +1440,20 @@ export class MissionOrchestrator {
   }
 
   private toSnapshot(session: MissionSession): MissionSnapshot {
+    const activeLeg: ExecutionLeg | null =
+      session.flightProgress?.leg ??
+      (session.route
+        ? session.route.targetIds.length === 0 &&
+          session.route.waypoints.length <= 1
+          ? "return"
+          : "outbound"
+        : null);
+
     return {
       missionId: session.missionId,
       scenarioId: session.scenario.id,
       status: session.status,
+      activeLeg,
       instruction: session.instruction,
       constraints: structuredClone(session.constraints),
       environmentVersion: session.environmentVersion,

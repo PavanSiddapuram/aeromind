@@ -21,6 +21,7 @@ export type VerifyRouteInput = {
   waypoints: Vector3[];
   returnWaypoints: Vector3[];
   inspectedTargetCount: number;
+  executionLeg?: "outbound" | "return" | undefined;
   drone: DroneState;
   constraints: MissionConstraints;
   scenario: ScenarioDefinition;
@@ -57,8 +58,8 @@ function makeFallbackEnergy(
 
 /**
  * Deterministic, fail-closed route verifier.
- * Evaluates waypoint bounds, altitude limits, expanded obstacle AABBs,
- * inflated no-fly zones, and mission + return-to-home energy reserves.
+ * Independently evaluates waypoint bounds, altitude limits, expanded obstacle AABBs,
+ * inflated no-fly zones, return-to-home connectivity, and mission + RTH energy reserves.
  */
 export function verifyRoute(input: VerifyRouteInput): VerificationReport {
   const policyVersion = input.policyVersion ?? VERIFIER_POLICY_VERSION;
@@ -86,10 +87,32 @@ export function verifyRoute(input: VerifyRouteInput): VerificationReport {
       throw new RangeError("Invalid maxAltitudeMeters constraint");
     }
 
-    if (input.waypoints.length < 2) {
+    const isReturnOnly =
+      input.executionLeg === "return" ||
+      (input.waypoints.length === 1 && input.inspectedTargetCount === 0);
+
+    if (isReturnOnly) {
+      if (input.waypoints.length < 1) {
+        violations.push({
+          code: "INVALID_WAYPOINT",
+          leg: "return",
+          message:
+            "Return-to-home verification requires the current drone anchor waypoint.",
+        });
+      }
+      if (input.inspectedTargetCount > 0) {
+        violations.push({
+          code: "INVALID_WAYPOINT",
+          leg: "return",
+          message:
+            "Return-only route must not include pending outbound target inspections.",
+        });
+      }
+    } else if (input.waypoints.length < 2) {
       violations.push({
         code: "INVALID_WAYPOINT",
-        message: "Route must contain at least two waypoints.",
+        leg: "outbound",
+        message: "Outbound route must contain at least two waypoints.",
       });
     }
 
@@ -108,13 +131,16 @@ export function verifyRoute(input: VerifyRouteInput): VerificationReport {
 
     const checkWaypointsAndSegments = (
       polyline: Vector3[],
-      legLabel: "mission" | "return-to-home",
+      leg: "outbound" | "return",
     ) => {
+      const legLabel = leg === "outbound" ? "mission" : "return-to-home";
+
       for (let i = 0; i < polyline.length; i += 1) {
         const wp = polyline[i];
         if (!wp || !isFiniteVector3(wp)) {
           violations.push({
             code: "INVALID_WAYPOINT",
+            leg,
             message: `${legLabel} waypoint ${i} has non-finite coordinates.`,
             segmentIndex: Math.max(0, i - 1),
           });
@@ -127,6 +153,7 @@ export function verifyRoute(input: VerifyRouteInput): VerificationReport {
         ) {
           violations.push({
             code: "INVALID_WAYPOINT",
+            leg,
             message: `${legLabel} waypoint ${i} (${wp.x.toFixed(1)}, ${wp.y.toFixed(1)}, ${wp.z.toFixed(1)}) is outside scenario bounds.`,
             segmentIndex: Math.max(0, i - 1),
             point: { ...wp },
@@ -136,6 +163,7 @@ export function verifyRoute(input: VerifyRouteInput): VerificationReport {
         if (wp.y > input.constraints.maxAltitudeMeters) {
           violations.push({
             code: "ALTITUDE_LIMIT",
+            leg,
             message: `${legLabel} waypoint ${i} altitude ${wp.y.toFixed(1)}m exceeds max limit ${input.constraints.maxAltitudeMeters}m.`,
             segmentIndex: Math.max(0, i - 1),
             point: { ...wp },
@@ -155,8 +183,9 @@ export function verifyRoute(input: VerifyRouteInput): VerificationReport {
           if (hit.intersects) {
             violations.push({
               code: "OBSTACLE_COLLISION",
+              leg,
               message: `${legLabel} segment ${i} violates ${obstacleMargin.toFixed(1)}m safety envelope of ${obstacle.id} (${obstacle.label}).`,
-              segmentIndex: legLabel === "mission" ? i : undefined,
+              segmentIndex: i,
               point: hit.point ?? { ...start },
               entityId: obstacle.id,
             });
@@ -168,8 +197,9 @@ export function verifyRoute(input: VerifyRouteInput): VerificationReport {
           if (hit.intersects) {
             violations.push({
               code: "NO_FLY_ZONE",
+              leg,
               message: `${legLabel} segment ${i} enters restricted airspace ${zone.id} (${zone.label}).`,
-              segmentIndex: legLabel === "mission" ? i : undefined,
+              segmentIndex: i,
               point: hit.point ?? { ...start },
               entityId: zone.id,
             });
@@ -178,7 +208,9 @@ export function verifyRoute(input: VerifyRouteInput): VerificationReport {
       }
     };
 
-    checkWaypointsAndSegments(input.waypoints, "mission");
+    if (input.waypoints.length > 0) {
+      checkWaypointsAndSegments(input.waypoints, "outbound");
+    }
 
     const missionEnd = input.waypoints[input.waypoints.length - 1];
     const alreadyAtHome =
@@ -188,8 +220,16 @@ export function verifyRoute(input: VerifyRouteInput): VerificationReport {
 
     const returnStart = input.returnWaypoints[0];
     const returnEnd = input.returnWaypoints[input.returnWaypoints.length - 1];
+
     const validReturnChain =
-      alreadyAtHome ||
+      (alreadyAtHome &&
+        (input.returnWaypoints.length === 0 ||
+          (returnStart !== undefined &&
+            returnEnd !== undefined &&
+            isFiniteVector3(returnStart) &&
+            isFiniteVector3(returnEnd) &&
+            equals(returnStart, missionEnd, 1e-3) &&
+            equals(returnEnd, input.scenario.homeBase.hoverPosition, 1e-3)))) ||
       (input.returnWaypoints.length >= 2 &&
         returnStart !== undefined &&
         returnEnd !== undefined &&
@@ -200,8 +240,8 @@ export function verifyRoute(input: VerifyRouteInput): VerificationReport {
         equals(returnStart, missionEnd, 1e-3) &&
         equals(returnEnd, input.scenario.homeBase.hoverPosition, 1e-3));
 
-    if (input.returnWaypoints.length >= 2) {
-      checkWaypointsAndSegments(input.returnWaypoints, "return-to-home");
+    if (input.returnWaypoints.length > 0) {
+      checkWaypointsAndSegments(input.returnWaypoints, "return");
     }
 
     const hasInvalidWaypoint = violations.some(
@@ -214,9 +254,9 @@ export function verifyRoute(input: VerifyRouteInput): VerificationReport {
           input.constraints.minLandingReservePercent,
         )
       : estimateMissionEnergy({
-          missionWaypoints: input.waypoints,
+          missionWaypoints: isReturnOnly ? [] : input.waypoints,
           returnWaypoints: input.returnWaypoints,
-          inspectedTargetCount: input.inspectedTargetCount,
+          inspectedTargetCount: isReturnOnly ? 0 : input.inspectedTargetCount,
           availableBatteryPercent: input.drone.batteryPercent,
           minLandingReservePercent: input.constraints.minLandingReservePercent,
           windMetersPerSecond: wind,
@@ -227,12 +267,14 @@ export function verifyRoute(input: VerifyRouteInput): VerificationReport {
     if (!hasInvalidWaypoint && !validReturnChain) {
       violations.push({
         code: "ENERGY_INFEASIBLE",
+        leg: "return",
         message:
           "No valid return-to-home path connects the final mission waypoint back to home base.",
       });
     } else if (!hasInvalidWaypoint && !energy.feasible) {
       violations.push({
         code: "ENERGY_INFEASIBLE",
+        leg: isReturnOnly ? "return" : "outbound",
         message: `Projected landing reserve ${energy.projectedLandingReservePercent.toFixed(1)}% is below required ${input.constraints.minLandingReservePercent.toFixed(1)}% (battery ${input.drone.batteryPercent.toFixed(1)}%, mission ${energy.estimatedMissionEnergyPercent.toFixed(1)}%, return ${energy.estimatedReturnEnergyPercent.toFixed(1)}%).`,
       });
     }

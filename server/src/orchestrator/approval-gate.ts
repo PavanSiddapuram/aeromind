@@ -65,7 +65,7 @@ export class ApprovalGate {
   revokeMissionApprovals(missionId: string, timestamp = new Date().toISOString()): number {
     let revokedCount = 0;
     for (const approval of this.approvals.values()) {
-      if (approval.missionId === missionId && !approval.revokedAt && !approval.consumedAt) {
+      if (approval.missionId === missionId && !approval.revokedAt) {
         approval.revokedAt = timestamp;
         revokedCount += 1;
       }

@@ -210,4 +210,34 @@ describe("3D navigation graph and A* search", () => {
     expect(resV2.route.nodeIds).not.toContain("N-SOUTH-CORRIDOR");
     expect(resV2.route.nodeIds).toContain("N-NORTH-CORRIDOR");
   });
+
+  it("resolves a pure Return-to-Home route (targetOrder=[]) with zero outbound distance and full returnWaypoints", () => {
+    const scenario = cloneScenarioSnapshot();
+    const roof02 = scenario.targets.find((t) => t.id === "ROOF-02")!;
+    const droneAtRoof02 = {
+      ...scenario.initialDrone,
+      position: { ...roof02.position },
+    };
+
+    const rthOnly = resolveMissionRoute({
+      routeId: "route-rth-only",
+      environmentVersion: 1,
+      scenario,
+      obstacles: scenario.obstacles,
+      targets: scenario.targets,
+      drone: droneAtRoof02,
+      constraints: scenario.defaultConstraints,
+      targetOrder: [],
+    });
+
+    expect(rthOnly.ok).toBe(true);
+    if (!rthOnly.ok) return;
+    expect(rthOnly.route.targetIds).toEqual([]);
+    expect(rthOnly.route.waypoints).toEqual([roof02.position]);
+    expect(rthOnly.route.distanceMeters).toBe(0);
+    expect(rthOnly.route.returnDistanceMeters).toBeGreaterThan(80);
+    expect(
+      rthOnly.route.returnWaypoints[rthOnly.route.returnWaypoints.length - 1],
+    ).toEqual(scenario.homeBase.hoverPosition);
+  });
 });

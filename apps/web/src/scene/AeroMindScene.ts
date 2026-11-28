@@ -67,6 +67,15 @@ function makeDrone(radiusMeters: number): {
   lens.position.set(0, -0.16 * scale, -0.64 * scale);
   group.add(lens);
 
+  // Forward heading cone (+Z local forward matches atan2(dx, dz) rotation.y convention)
+  const headingArrow = new THREE.Mesh(
+    new THREE.ConeGeometry(0.22 * scale, 0.55 * scale, 12),
+    accentMaterial,
+  );
+  headingArrow.rotation.x = Math.PI / 2;
+  headingArrow.position.set(0, 0.08 * scale, 0.85 * scale);
+  group.add(headingArrow);
+
   // Mast positions at radial distance ~1.26 m; plus 0.48 m blade radius = 1.74 m <= 1.8 m.
   const rotorPositions = [
     [-0.95 * scale, 0.14 * scale, -0.82 * scale],
@@ -256,7 +265,6 @@ export class AeroMindScene {
     returnWaypoints?: DomainVec3[],
   ): void {
     disposeGroupChildren(this.routeGroup);
-    if (waypoints.length < 2) return;
 
     const palette: Record<RouteVisualMode, number> = {
       preview: 0x4be0cf,
@@ -265,33 +273,35 @@ export class AeroMindScene {
       rejected: 0xf07167,
     };
     const routeColor = palette[mode];
-    const points = waypoints.map(toThreeVec3);
 
-    const material =
-      mode === "preview" || mode === "rejected"
-        ? new THREE.LineDashedMaterial({
-            color: routeColor,
-            dashSize: 2.2,
-            gapSize: 1.2,
-          })
-        : new THREE.LineBasicMaterial({ color: routeColor });
+    if (waypoints.length >= 2) {
+      const points = waypoints.map(toThreeVec3);
+      const material =
+        mode === "preview" || mode === "rejected"
+          ? new THREE.LineDashedMaterial({
+              color: routeColor,
+              dashSize: 2.2,
+              gapSize: 1.2,
+            })
+          : new THREE.LineBasicMaterial({ color: routeColor });
 
-    const line = new THREE.Line(
-      new THREE.BufferGeometry().setFromPoints(points),
-      material,
-    );
-    if (material instanceof THREE.LineDashedMaterial) {
-      line.computeLineDistances();
-    }
-    this.routeGroup.add(line);
-
-    for (const point of points.slice(1)) {
-      const wp = new THREE.Mesh(
-        new THREE.SphereGeometry(0.68, 12, 10),
-        new THREE.MeshBasicMaterial({ color: routeColor }),
+      const line = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints(points),
+        material,
       );
-      wp.position.copy(point);
-      this.routeGroup.add(wp);
+      if (material instanceof THREE.LineDashedMaterial) {
+        line.computeLineDistances();
+      }
+      this.routeGroup.add(line);
+
+      for (const point of points.slice(1)) {
+        const wp = new THREE.Mesh(
+          new THREE.SphereGeometry(0.68, 12, 10),
+          new THREE.MeshBasicMaterial({ color: routeColor }),
+        );
+        wp.position.copy(point);
+        this.routeGroup.add(wp);
+      }
     }
 
     if (returnWaypoints && returnWaypoints.length >= 2) {
@@ -303,7 +313,7 @@ export class AeroMindScene {
           dashSize: 1.6,
           gapSize: 1.4,
           transparent: true,
-          opacity: 0.72,
+          opacity: 0.78,
         }),
       );
       rthLine.computeLineDistances();
@@ -311,7 +321,11 @@ export class AeroMindScene {
     }
   }
 
-  setViolations(violations: RouteViolation[], waypoints?: DomainVec3[]): void {
+  setViolations(
+    violations: RouteViolation[],
+    waypoints?: DomainVec3[],
+    returnWaypoints?: DomainVec3[],
+  ): void {
     disposeGroupChildren(this.violationGroup);
 
     for (const violation of violations) {
@@ -340,14 +354,19 @@ export class AeroMindScene {
         this.violationGroup.add(halo);
       }
 
+      const activeLegPoints =
+        violation.leg === "return" && returnWaypoints && returnWaypoints.length >= 2
+          ? returnWaypoints
+          : waypoints;
+
       if (
-        waypoints &&
+        activeLegPoints &&
         violation.segmentIndex !== undefined &&
         violation.segmentIndex >= 0 &&
-        violation.segmentIndex < waypoints.length - 1
+        violation.segmentIndex < activeLegPoints.length - 1
       ) {
-        const a = waypoints[violation.segmentIndex];
-        const b = waypoints[violation.segmentIndex + 1];
+        const a = activeLegPoints[violation.segmentIndex];
+        const b = activeLegPoints[violation.segmentIndex + 1];
         if (a && b) {
           const seg = new THREE.Line(
             new THREE.BufferGeometry().setFromPoints([
@@ -379,6 +398,12 @@ export class AeroMindScene {
   captureStillDataUrl(): string {
     this.renderer.render(this.scene, this.camera);
     return this.renderer.domElement.toDataURL("image/jpeg", 0.78);
+  }
+
+  resetCameraView(): void {
+    this.camera.position.set(104, 86, 114);
+    this.controls.target.set(0, 10, 0);
+    this.controls.update();
   }
 
   private addObstacleMesh(obstacle: ScenarioObstacle): void {

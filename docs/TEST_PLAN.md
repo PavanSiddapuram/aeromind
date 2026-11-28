@@ -41,19 +41,26 @@ Boundary semantics must be documented and consistent. Prefer conservative collis
 - Return path unavailable: no return-feasible approval.
 - Wind/climb changes recompute cost from current state.
 
-## 5. Mission/orchestration tests
+## 5. Mission, remaining-route, and orchestration tests
 
-- Valid Gemini proposal proceeds to navigation.
-- Unknown node/target is rejected.
-- Malformed model output fails closed.
-- Collision causes approval rejection.
-- Local reroute succeeds without unnecessary Gemini call.
-- No local route triggers mission-level planner.
-- Two failed repair attempts end in safe hold.
-- Environment version change revokes prior approval.
-- Stale approval cannot start execution.
-- Verifier exception cannot produce approval.
-- SSE disconnect does not change mission state.
+- Valid planner proposal proceeds through A* resolution, verification, single-use approval, execution, and RTH completion (`orchestrator.test.ts`, `e2e-lifecycle.test.ts`).
+- Unknown node/target IDs, duplicate targets, non-pending targets, and `targetOrder`/`abortedObjectives` overlaps are rejected (`plan-validator.test.ts`, `api.test.ts`).
+- Malformed model output and missing/failed provider credentials fail closed (`gemini-planner.test.ts`, `api.test.ts`).
+- Legal vs. illegal state transitions and `ApprovalGate` single-use/version/revocation invariants are enforced (`state-machine.test.ts`, `approval-gate.test.ts`).
+- Remaining-route recovery (`remaining-route.test.ts`) verifies all 10 stage cases:
+  1. Environment mutation while `READY` before execution preserves full outbound and RTH paths.
+  2. Obstacle during outbound leg excludes visited targets and reroutes from live 3D position.
+  3. Obstacle during return-to-home reroutes to `N-BASE` without reintroducing visited targets (`0` mission/dwell energy).
+  4. Battery mutation while `PAUSED` preserves exact segment progress.
+  5. Drone paused halfway along a segment starts at exact 3D midpoint.
+  6. Drone positioned at an intermediate waypoint emits no zero-length duplicate segment.
+  7. All outbound targets visited yields `0` pending target inspections and RTH-only verification.
+  8. No remaining reachable targets enters `SAFE_HOLD` with `approval: null`.
+  9. Blocked home base (`no valid path to home`) enters `SAFE_HOLD` with `0` unnecessary AI calls.
+  10. Insufficient projected return reserve fails closed with `ENERGY_INFEASIBLE`.
+- Invalid mutation inputs fail atomically without incrementing `environmentVersion` or revoking active approvals.
+- Failed repair attempt 1 does not prematurely mark candidate targets `"abandoned"` before repair attempt 2.
+- SSE disconnect does not alter authoritative mission state.
 
 ## 6. API tests
 
